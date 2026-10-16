@@ -72,7 +72,7 @@ class GatewayTest(unittest.TestCase):
 
     def test_bad_rotation_retains_active_version(self):
         revision = self.authorize()
-        self.gateway.check = lambda key: "invalid"
+        self.gateway.check = lambda key, *, legacy=False: "invalid"
         response = self.management.put("/v1/authorization", headers=self.admin,
                                        json={"api_key": "different-valid-shape", "expected_revision": revision})
         self.assertEqual(response.status_code, 422)
@@ -84,7 +84,7 @@ class GatewayTest(unittest.TestCase):
         reopened = Store(str(Path(self.temp.name) / "state.sqlite3"), self.encryption_key)
         self.assertEqual(reopened.overview("org-one")["status"], "active")
         self.assertEqual(reopened.decrypt("org-one", 1), KEY)
-        self.gateway.check = lambda key: "invalid"
+        self.gateway.check = lambda key, *, legacy=False: "invalid"
         result = self.management.post("/v1/authorization/check", headers=self.admin, json={})
         self.assertEqual(result.status_code, 200)
         self.assertEqual(result.json()["status"], "invalid")

@@ -111,11 +111,26 @@ class Gateway:
     def __init__(self, store: Store, client: httpx.Client | None = None):
         self.store = store
         self.calls = Calls(store)
-        self.client = client or httpx.Client(follow_redirects=False, timeout=20)
+        # Explicit direct accounts never inherit deployment or host proxies.
+        self.client = client or httpx.Client(follow_redirects=False, timeout=20, trust_env=False)
+        self._legacy_client = client
 
-    def check(self, key: str) -> str:
+    @property
+    def legacy_client(self):
+        # Only original submissions and original credential management use the
+        # unchanged legacy deployment transport until their Network mapping exists.
+        if self._legacy_client is None:
+            self._legacy_client = httpx.Client(follow_redirects=False, timeout=20, trust_env=True)
+        return self._legacy_client
+
+    def close(self):
+        self.client.close()
+        if self._legacy_client is not None and self._legacy_client is not self.client:
+            self._legacy_client.close()
+
+    def check(self, key: str, *, legacy=False) -> str:
         try:
-            response = self.client.get(CHECK, params={"endpoint_id": MODEL, "limit": 1},
+            response = (self.legacy_client if legacy else self.client).get(CHECK, params={"endpoint_id": MODEL, "limit": 1},
                                        headers={"Authorization": "Key " + key}, timeout=15)
         except httpx.HTTPError:
             return "unavailable"
@@ -161,7 +176,7 @@ class Gateway:
             return {"id": item["id"], "state": item["state"]}
         key = self.store.decrypt(organization_id, item["credential_version"])
         try:
-            response = self.client.post(QUEUE + "/" + MODEL, json=payload,
+            response = self.legacy_client.post(QUEUE + "/" + MODEL, json=payload,
                                         headers={"Authorization": "Key " + key}, timeout=60)
         except httpx.ConnectError:
             self.store.reject_submission(item["id"])
@@ -187,7 +202,7 @@ class Gateway:
         if not item["provider_request_id"]:
             return {"id": item["id"], "state": item["state"]}
         key = self.store.decrypt(organization_id, item["credential_version"])
-        response = self._remote(item, key, result)
+        response = self._remote(item, key, result, legacy=True)
         try:
             self.calls.get(organization_id, submission_id, 'legacy-video-mcp')
         except KeyError:
@@ -229,10 +244,10 @@ class Gateway:
             projected['video_url'] = response['video_url']
         return projected
 
-    def _remote(self, item, key, result, *, timeout=30):
+    def _remote(self, item, key, result, *, timeout=30, legacy=False):
         url = QUEUE + "/minimax/h3/requests/" + item["provider_request_id"] + ("" if result else "/status")
         try:
-            response = self.client.get(url, headers={"Authorization": "Key " + key}, timeout=timeout)
+            response = (self.legacy_client if legacy else self.client).get(url, headers={"Authorization": "Key " + key}, timeout=timeout)
         except httpx.HTTPError:
             raise APIError("provider_unavailable", 503) from None
         if response.status_code in {401, 403}:
@@ -263,7 +278,12 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
     if gateway is None:
         gateway = Gateway(Store(os.environ.get("FAL_STATE_DB", "/data/fal/state.sqlite3"),
                                 os.environ["FAL_ENCRYPTION_KEY"]))
-        migrate_legacy(gateway.store)
+        try:
+            migrate_legacy(gateway.store, legacy_proxy_configured=any(os.environ.get(name) for name in
+                ('HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy')))
+        except Exception:
+            gateway.close()
+            raise
     management_token = management_token if management_token is not None else os.environ.get("FAL_MANAGEMENT_TOKEN", "")
     execution_token = execution_token if execution_token is not None else os.environ.get("FAL_EXECUTION_TOKEN", "")
     dashboard_path = Path(os.environ.get("FAL_DASHBOARD_DIR", "/app/dashboard"))
@@ -371,7 +391,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                     raise APIError("invalid_key")
                 revision = number(data.get("expected_revision"), 0, 2**31 - 1)
                 version = gateway.store.candidate(org, key, revision)
-                state = await run_in_threadpool(gateway.check, key)
+                state = await run_in_threadpool(gateway.check, key, legacy=True)
                 if state == "active":
                     return respond(gateway.store.activate(org, version, revision))
                 gateway.store.mark_candidate(org, version, state)
@@ -385,7 +405,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                 if not current["version"]:
                     raise APIError("authorization_required", 409)
                 key = gateway.store.decrypt(org, current["version"])
-                state = await run_in_threadpool(gateway.check, key)
+                state = await run_in_threadpool(gateway.check, key, legacy=True)
                 return respond(gateway.store.recheck(org, state))
             if path == "/v1/limits" and request.method == "PUT":
                 data = await body(request)

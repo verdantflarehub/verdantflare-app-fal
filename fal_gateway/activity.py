@@ -47,7 +47,7 @@ def activity(gateway, *, max_pending=16, budget_seconds=4):
                 # _remote performs a GET using the original request identity;
                 # unlike remote()/remote_call(), it does not change local state.
                 observed = gateway._remote(item, key, False,
-                    timeout=min(2, max(.01, deadline - time.monotonic())))
+                    timeout=min(2, max(.01, deadline - time.monotonic())), legacy=item['source'] == 'legacy')
                 if observed['state'] not in {'completed', 'in_queue', 'in_progress'}:
                     raise ActivityUnavailable()
                 active += observed['state'] != 'completed'

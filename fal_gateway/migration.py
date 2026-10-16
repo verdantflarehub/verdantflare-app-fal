@@ -5,7 +5,7 @@ import uuid
 from .store import now
 
 
-def migrate_legacy(store):
+def migrate_legacy(store, *, legacy_proxy_configured=False):
     """Run after Accounts/Calls schema initialization and before accepting requests."""
     with store.connect() as db:
         db.execute('BEGIN IMMEDIATE')
@@ -13,6 +13,10 @@ def migrate_legacy(store):
             return
         timestamp = now()
         organizations = db.execute('SELECT * FROM organizations ORDER BY organization_id').fetchall()
+        if legacy_proxy_configured and db.execute('SELECT 1 FROM credentials LIMIT 1').fetchone():
+            # Never stamp a proxied historical account as direct. The Network
+            # reference must be resolved before this cutover can be enabled.
+            raise ValueError('legacy_proxy_mapping_required')
         for org in organizations:
             organization = org['organization_id']
             credentials = db.execute('SELECT * FROM credentials WHERE organization_id=? ORDER BY version',

@@ -114,6 +114,17 @@ class MigrationTest(unittest.TestCase):
         with self.assertRaisesRegex(Conflict, 'historical_cost_unknown'):
             self.gateway.calls.reserve('org', 'video', 'new', 'task', MODEL, PAYLOAD, None, '1')
 
+    def test_existing_proxy_blocks_cutover_without_mutating_original_data(self):
+        old = self.gateway.submit('org', 'original', PAYLOAD)
+        with self.store.connect() as db:
+            before = '\n'.join(db.iterdump())
+        with self.assertRaisesRegex(ValueError, '^legacy_proxy_mapping_required$'):
+            migrate_legacy(self.store, legacy_proxy_configured=True)
+        with self.store.connect() as db:
+            self.assertEqual(before, '\n'.join(db.iterdump()))
+        self.assertEqual(self.gateway.submit('org', 'original', PAYLOAD), old)
+        self.assertEqual(self.gateway.remote('org', old['id'])['state'], 'completed')
+
 
 if __name__ == '__main__':
     unittest.main()
