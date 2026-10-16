@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import uuid
+from .proxy import proxy_reference
 from decimal import Decimal, InvalidOperation
 from datetime import datetime
 
@@ -103,13 +104,17 @@ class Accounts:
             return self.project(self.row(db, organization, account))
 
     def credential(self, organization, account):
+        revision, key, _ = self.connection(organization, account)
+        return revision, key
+
+    def connection(self, organization, account):
         with self.store.connect() as db:
             row = self.row(db, organization, account)
             if row['status'] == 'archived':
                 raise Conflict('account_archived')
             credential = db.execute('SELECT ciphertext FROM channel_account_credentials '
                 'WHERE account_id=? AND version=?', (account, row['credential_version'])).fetchone()
-            return row['revision'], self.store.cipher.decrypt(credential['ciphertext']).decode()
+            return row['revision'], self.store.cipher.decrypt(credential['ciphertext']).decode(), json.loads(row['proxy_json'])
 
     def checked(self, organization, actor, account, revision, state, new_key=None):
         if state not in {'active', 'invalid', 'unavailable'}:
@@ -149,7 +154,7 @@ class Accounts:
                               ' ORDER BY created_at,id LIMIT ? OFFSET ?', [*args, limit, offset]).fetchall()
             return {'schema_version': 1, 'items': [self.project(row) for row in rows], 'total': total}
 
-    def create(self, organization, actor, operation, value):
+    def create(self, organization, actor, operation, value, *, validate_proxy=None):
         if not isinstance(operation, str) or not 1 <= len(operation) <= 128:
             raise ValueError('idempotency_key_required')
         if set(value) - {'name', 'api_url', 'api_key', 'proxy', 'status', 'default', 'registration', 'quota_subject_id'}:
@@ -160,10 +165,7 @@ class Accounts:
         # Execution and control APIs have distinct fixed, reviewed origins.
         if value.get('api_url') != 'https://queue.fal.run':
             raise ValueError('unsupported_api_url')
-        proxy = value.get('proxy')
-        if proxy != {'mode': 'direct'}:
-            # No invented proxy store or silent direct fallback before Network resolution is wired.
-            raise ValueError('proxy_unavailable')
+        proxy = proxy_reference(value.get('proxy'))
         status = value.get('status', 'active')
         default = value.get('default', False)
         name = value.get('name', '').strip() if isinstance(value.get('name', ''), str) else ''
@@ -186,6 +188,8 @@ class Accounts:
                 if not hmac.compare_digest(prior['digest'], digest):
                     raise Conflict('idempotency_conflict')
                 return self.project(self.row(db, organization, prior['account_id']))
+            if validate_proxy is not None:
+                validate_proxy(proxy)
             if default:
                 db.execute('UPDATE channel_accounts SET is_default=0,revision=revision+1,updated_at=? '
                            'WHERE organization_id=? AND is_default=1', (timestamp, organization))
@@ -202,7 +206,7 @@ class Accounts:
     def patch(self, organization, actor, account, revision, value, *, archive=False):
         if type(revision) is not int or revision < 1:
             raise ValueError('expected_revision_required')
-        if set(value) - {'name', 'status', 'default', 'registration'}:
+        if set(value) - {'name', 'status', 'default', 'registration', 'proxy'}:
             raise ValueError('invalid_account')
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -219,12 +223,15 @@ class Accounts:
             if status not in ({'archived'} if archive else {'active', 'disabled'}):
                 raise ValueError('invalid_status')
             registration = self.registration(value.get('registration', json.loads(row['registration_json'])))
+            proxy = proxy_reference(value.get('proxy', json.loads(row['proxy_json'])))
+            authorization = row['authorization_state'] if proxy == json.loads(row['proxy_json']) else 'pending_verification'
             timestamp = now()
             if default:
                 db.execute('UPDATE channel_accounts SET is_default=0,revision=revision+1,updated_at=? '
                            'WHERE organization_id=? AND id!=? AND is_default=1', (timestamp, organization, account))
-            db.execute('UPDATE channel_accounts SET name=?,status=?,is_default=?,registration_json=?,revision=revision+1,'
-                       'updated_at=? WHERE id=?', (name.strip(), status, int(default), json.dumps(registration), timestamp, account))
+            db.execute('UPDATE channel_accounts SET name=?,status=?,is_default=?,registration_json=?,proxy_json=?,authorization_state=?,revision=revision+1,'
+                       'updated_at=? WHERE id=?', (name.strip(), status, int(default), json.dumps(registration),
+                       json.dumps(proxy), authorization, timestamp, account))
             db.execute('INSERT INTO channel_account_audit VALUES (NULL,?,?,?,?,?,?)',
                        (organization, account, actor, 'archived' if archive else 'updated', revision + 1, timestamp))
             return self.project(self.row(db, organization, account))

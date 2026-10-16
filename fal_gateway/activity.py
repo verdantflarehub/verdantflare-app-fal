@@ -39,15 +39,24 @@ def activity(gateway, *, max_pending=16, budget_seconds=4):
                 active += 1
                 continue
             try:
+                legacy_transport = item['source'] == 'legacy'
                 if item['source'] == 'legacy':
                     key = gateway.store.decrypt(item['organization_id'], item['credential_version'])
+                    try:
+                        imported = gateway.calls.get(item['organization_id'], item['id'], 'legacy-video-mcp')
+                    except KeyError:
+                        pass
+                    else:
+                        item['proxy_json'] = imported['proxy_json']
+                        legacy_transport = False
                 else:
                     record = gateway.calls.get(item['organization_id'], item['id'])
                     key = gateway.calls.credential(record)
+                    item = {**record, 'source': 'channel'}
                 # _remote performs a GET using the original request identity;
                 # unlike remote()/remote_call(), it does not change local state.
                 observed = gateway._remote(item, key, False,
-                    timeout=min(2, max(.01, deadline - time.monotonic())), legacy=item['source'] == 'legacy')
+                    timeout=min(2, max(.01, deadline - time.monotonic())), legacy=legacy_transport)
                 if observed['state'] not in {'completed', 'in_queue', 'in_progress'}:
                     raise ActivityUnavailable()
                 active += observed['state'] != 'completed'

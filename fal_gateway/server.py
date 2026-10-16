@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import uuid
+from contextlib import contextmanager
 from urllib.parse import urlsplit
 
 import httpx
@@ -24,8 +25,9 @@ from .store import Conflict, Store
 from .accounts import Accounts
 from .calls import Calls
 from .ownership import execution_owner
-from .migration import migrate_legacy
+from .migration import migrate_legacy, resolve_legacy_proxies
 from .activity import activity, ActivityUnavailable
+from .proxy import NetworkProxies, ProxyUnavailable, proxy_reference
 
 MODEL = "minimax/h3/reference-to-video"
 QUEUE = "https://queue.fal.run"
@@ -108,12 +110,44 @@ def authenticate(request: Request, token: str, *, manage: bool) -> str:
 
 
 class Gateway:
-    def __init__(self, store: Store, client: httpx.Client | None = None):
+    def __init__(self, store: Store, client: httpx.Client | None = None, *, network=None):
         self.store = store
         self.calls = Calls(store)
         # Explicit direct accounts never inherit deployment or host proxies.
         self.client = client or httpx.Client(follow_redirects=False, timeout=20, trust_env=False)
         self._legacy_client = client
+        self.network = network
+
+    def validate_proxy(self, organization, value):
+        value = proxy_reference(value)
+        if value['mode'] == 'proxy':
+            if self.network is None:
+                raise ProxyUnavailable()
+            self.network.resolve_url(organization, value)
+        return value
+
+    @contextmanager
+    def transport(self, organization, value, *, legacy=False):
+        if legacy:
+            yield self.legacy_client
+            return
+        value = proxy_reference(value)
+        if value['mode'] == 'direct':
+            yield self.client
+            return
+        if self.network is None:
+            raise ProxyUnavailable()
+        try:
+            client = httpx.Client(proxy=self.network.resolve_url(organization, value),
+                                 trust_env=False, follow_redirects=False, timeout=20)
+        except (ValueError, ImportError):
+            raise ProxyUnavailable() from None
+        # Do not catch errors across yield: after a supplier request starts,
+        # transport errors must remain acceptance-unknown, never local rejection.
+        try:
+            yield client
+        finally:
+            client.close()
 
     @property
     def legacy_client(self):
@@ -127,12 +161,15 @@ class Gateway:
         self.client.close()
         if self._legacy_client is not None and self._legacy_client is not self.client:
             self._legacy_client.close()
+        if self.network is not None:
+            self.network.close()
 
-    def check(self, key: str, *, legacy=False) -> str:
+    def check(self, key: str, *, legacy=False, organization='', proxy=None) -> str:
         try:
-            response = (self.legacy_client if legacy else self.client).get(CHECK, params={"endpoint_id": MODEL, "limit": 1},
-                                       headers={"Authorization": "Key " + key}, timeout=15)
-        except httpx.HTTPError:
+            with self.transport(organization, proxy or {'mode': 'direct'}, legacy=legacy) as client:
+                response = client.get(CHECK, params={"endpoint_id": MODEL, "limit": 1},
+                                      headers={"Authorization": "Key " + key}, timeout=15)
+        except (httpx.HTTPError, ProxyUnavailable):
             return "unavailable"
         if response.status_code in {401, 403}:
             return "invalid"
@@ -202,12 +239,12 @@ class Gateway:
         if not item["provider_request_id"]:
             return {"id": item["id"], "state": item["state"]}
         key = self.store.decrypt(organization_id, item["credential_version"])
-        response = self._remote(item, key, result, legacy=True)
         try:
-            self.calls.get(organization_id, submission_id, 'legacy-video-mcp')
+            imported = self.calls.get(organization_id, submission_id, 'legacy-video-mcp')
         except KeyError:
-            pass
+            return self._remote(item, key, result, legacy=True)
         else:
+            response = self._remote({**item, 'proxy_json': imported['proxy_json']}, key, result)
             self.calls.observed(submission_id, 'failed' if response.get('failed') else response['state'])
         return response
 
@@ -217,8 +254,13 @@ class Gateway:
             return self.calls.project(item)
         key = self.calls.credential(item)
         try:
-            response = self.client.post(QUEUE + '/' + MODEL, json=payload,
-                                        headers={'Authorization': 'Key ' + key}, timeout=60)
+            with self.transport(org, json.loads(item['proxy_json'])) as client:
+                response = client.post(QUEUE + '/' + MODEL, json=payload,
+                                       headers={'Authorization': 'Key ' + key}, timeout=60)
+        except ProxyUnavailable:
+            # Resolution failed before any supplier request was made.
+            self.calls.rejected(item['id'])
+            raise APIError('proxy_unavailable', 503) from None
         except httpx.HTTPError:
             # Even a connection interruption is not evidence of upstream non-acceptance.
             return self.calls.project(item)
@@ -247,7 +289,10 @@ class Gateway:
     def _remote(self, item, key, result, *, timeout=30, legacy=False):
         url = QUEUE + "/minimax/h3/requests/" + item["provider_request_id"] + ("" if result else "/status")
         try:
-            response = (self.legacy_client if legacy else self.client).get(url, headers={"Authorization": "Key " + key}, timeout=timeout)
+            with self.transport(item['organization_id'], json.loads(item.get('proxy_json', '{"mode":"direct"}')), legacy=legacy) as client:
+                response = client.get(url, headers={"Authorization": "Key " + key}, timeout=timeout)
+        except ProxyUnavailable:
+            raise APIError('proxy_unavailable', 503) from None
         except httpx.HTTPError:
             raise APIError("provider_unavailable", 503) from None
         if response.status_code in {401, 403}:
@@ -276,11 +321,15 @@ class Gateway:
 def create_apps(gateway: Gateway | None = None, management_token: str | None = None,
                 execution_token: str | None = None):
     if gateway is None:
+        origin, token = os.environ.get('FAL_NETWORK_URL', ''), os.environ.get('FAL_NETWORK_TOKEN', '')
+        network = NetworkProxies(origin, token) if origin or token else None
         gateway = Gateway(Store(os.environ.get("FAL_STATE_DB", "/data/fal/state.sqlite3"),
-                                os.environ["FAL_ENCRYPTION_KEY"]))
+                                os.environ["FAL_ENCRYPTION_KEY"]), network=network)
         try:
-            migrate_legacy(gateway.store, legacy_proxy_configured=any(os.environ.get(name) for name in
-                ('HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy')))
+            legacy_url = next((os.environ[name] for name in ('https_proxy', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY') if os.environ.get(name)), '')
+            reference = json.loads(os.environ['FAL_LEGACY_PROXY_REFERENCE']) if os.environ.get('FAL_LEGACY_PROXY_REFERENCE') else None
+            mappings = resolve_legacy_proxies(gateway.store, network, legacy_url, reference)
+            migrate_legacy(gateway.store, legacy_proxy_configured=bool(legacy_url), legacy_proxies=mappings)
         except Exception:
             gateway.close()
             raise
@@ -299,8 +348,8 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
             finished.exception()
 
     async def refresh_account(org, actor, account_id):
-        revision, key = accounts.credential(org, account_id)
-        state = await run_in_threadpool(gateway.check, key)
+        revision, key, proxy = accounts.connection(org, account_id)
+        state = await run_in_threadpool(gateway.check, key, organization=org, proxy=proxy)
         account = accounts.checked(org, actor, account_id, revision, state)
         return {"schema_version": 1, "account": account,
                 "authorization_state": state, "balance_status": "manual_only"}
@@ -326,6 +375,13 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                 return Response(data, headers={"Content-Type": mime, "Cache-Control": "no-store",
                                                "X-Content-Type-Options": "nosniff"})
             org = authenticate(request, management_token, manage=True)
+            if path == '/v1/proxies':
+                if gateway.network is None:
+                    return respond({'schema_version': 1, 'items': []})
+                try:
+                    return respond(await run_in_threadpool(gateway.network.list, org))
+                except ProxyUnavailable:
+                    raise APIError('proxy_unavailable', 503) from None
             if path == '/v1/activity':
                 try:
                     return respond(await run_in_threadpool(activity, gateway))
@@ -349,8 +405,13 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                 operation = data.pop('operation_id', request.headers.get('idempotency-key', ''))
                 if request.headers.get('idempotency-key', operation) != operation:
                     raise APIError('idempotency_key_mismatch')
-                return respond(accounts.create(org, request.headers["x-user-id"],
-                    operation, data), 201)
+                proxy_reference(data.get('proxy'))
+                try:
+                    created = await run_in_threadpool(accounts.create, org, request.headers['x-user-id'],
+                        operation, data, validate_proxy=lambda value: gateway.validate_proxy(org, value))
+                except ProxyUnavailable:
+                    raise APIError('proxy_unavailable', 503) from None
+                return respond(created, 201)
             if "account_id" in request.path_params:
                 account_id = str(request.path_params["account_id"])
                 if path.endswith("/refresh"):
@@ -368,9 +429,10 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                     if not isinstance(key, str) or not 16 <= len(key) <= 4096 or any(c.isspace() for c in key):
                         raise APIError("invalid_key")
                     revision = number(data.get("expected_revision"), 1, 2**31 - 1)
-                    if accounts.get(org, account_id)["revision"] != revision:
+                    current_revision, _, proxy = accounts.connection(org, account_id)
+                    if current_revision != revision:
                         raise Conflict("revision_conflict")
-                    state = await run_in_threadpool(gateway.check, key)
+                    state = await run_in_threadpool(gateway.check, key, organization=org, proxy=proxy)
                     result = accounts.checked(org, request.headers["x-user-id"], account_id, revision, state, key)
                     return respond({"schema_version": 1, "account": result, "authorization_state": state},
                                    200 if state == "active" else 422 if state == "invalid" else 503)
@@ -378,6 +440,12 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                     return respond(accounts.get(org, account_id))
                 data = await body(request)
                 revision = data.pop("expected_revision", None)
+                if 'proxy' in data:
+                    proxy_reference(data['proxy'])
+                    try:
+                        await run_in_threadpool(gateway.validate_proxy, org, data['proxy'])
+                    except ProxyUnavailable:
+                        raise APIError('proxy_unavailable', 503) from None
                 return respond(accounts.patch(org, request.headers["x-user-id"], account_id, revision,
                     data, archive=request.method == "DELETE"))
             if path in {"/v1/overview", "/v1/authorization", "/v1/limits"} and request.method == "GET":
@@ -471,7 +539,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
     async def health(request):
         return respond({"service": "video-fal-gateway", "version": __version__, "status": "ok"})
 
-    management = Starlette(routes=[Route("/health", health), Route('/v1/activity', manage),
+    management = Starlette(routes=[Route("/health", health), Route('/v1/activity', manage), Route('/v1/proxies', manage),
         Route("/internal/dashboard-declaration", manage), Route("/internal/dashboard-index", manage),
         Route("/internal/dashboard/{asset:path}", manage),
         Route('/v1/calls', manage),

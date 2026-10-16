@@ -1,13 +1,16 @@
 from pathlib import Path
+import json
 import tempfile
 import unittest
+from unittest.mock import patch
+from contextlib import contextmanager
 
 from cryptography.fernet import Fernet
 import httpx
 
 from fal_gateway.accounts import Accounts
 from fal_gateway.calls import Calls
-from fal_gateway.migration import migrate_legacy
+from fal_gateway.migration import migrate_legacy, resolve_legacy_proxies
 from fal_gateway.server import Gateway, MODEL
 from fal_gateway.store import Store, Conflict
 from test_gateway import KEY, PAYLOAD
@@ -124,6 +127,90 @@ class MigrationTest(unittest.TestCase):
             self.assertEqual(before, '\n'.join(db.iterdump()))
         self.assertEqual(self.gateway.submit('org', 'original', PAYLOAD), old)
         self.assertEqual(self.gateway.remote('org', old['id'])['state'], 'completed')
+
+    def test_explicit_proxy_mapping_preserves_original_calls_and_rejects_different_exit(self):
+        reference = {'mode': 'proxy', 'proxy_id': '0199b501-0000-7000-8000-000000000002', 'revision': 4}
+        class Resolver:
+            url = 'socks5h://proxy.example.invalid:1081'
+            def resolve_url(self, organization, value):
+                if organization != 'org' or value != reference:
+                    raise ValueError('unexpected mapping')
+                return self.url
+        resolver = Resolver()
+        old = self.gateway.submit('org', 'original', PAYLOAD)
+        for url in ['http://other.example.invalid:1081', 'http://proxy.example.invalid:1082',
+                    'http://user:secret@proxy.example.invalid:1081']:
+            with self.assertRaisesRegex(ValueError, '^legacy_proxy_mapping_unverified$'):
+                resolve_legacy_proxies(self.store, resolver, url, reference)
+        mappings = resolve_legacy_proxies(self.store, resolver, 'http://proxy.example.invalid:1081', reference)
+        migrate_legacy(self.store, legacy_proxy_configured=True, legacy_proxies=mappings)
+        self.assertEqual(self.imported()['proxy'], reference)
+        self.assertEqual(json.loads(self.gateway.calls.get('org', old['id'])['proxy_json']), reference)
+        @contextmanager
+        def mapped_transport(organization, value, *, legacy=False):
+            self.assertEqual(organization, 'org')
+            self.assertEqual(value, reference)
+            self.assertFalse(legacy)
+            yield self.gateway.client
+        with patch.object(self.gateway, 'transport', mapped_transport):
+            self.assertEqual(self.gateway.remote('org', old['id'])['state'], 'completed')
+
+    def legacy_writes_after_failed_upgrade(self):
+        # Original 0.1.0 ignores the newer cutover marker. Simulate its SQL writes.
+        with self.store.connect() as db:
+            db.execute("INSERT INTO credentials SELECT organization_id,version+1,ciphertext,state,checked_at,created_at FROM credentials WHERE version=1")
+            db.execute('UPDATE organizations SET active_version=2,revision=revision+1,daily_limit=7')
+            db.execute("INSERT INTO submissions SELECT 'after-rollback',organization_id,'after-rollback',digest,2,model_id,'remote-after-rollback','queued',created_at FROM submissions LIMIT 1")
+
+    def test_failed_upgrade_retry_imports_old_writes_and_preserves_account_id(self):
+        old = self.gateway.submit('org', 'original', PAYLOAD)
+        migrate_legacy(self.store)
+        original_account = self.imported()['account_id']
+        self.legacy_writes_after_failed_upgrade()
+        migrate_legacy(self.store)
+        self.assertEqual(self.imported()['account_id'], original_account)
+        self.assertEqual(self.imported()['registration']['daily_limit'], 7)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM channel_account_credentials').fetchone()[0], 2)
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM channel_calls').fetchone()[0], 2)
+            self.assertEqual(db.execute('SELECT credential_version FROM channel_accounts').fetchone()[0], 2)
+        self.assertEqual(self.gateway.calls.get('org', old['id'])['provider_request_id'], 'legacy-remote')
+        migrate_legacy(self.store)
+        self.assertEqual(self.gateway.calls.list('org')['total'], 2)
+        self.assertEqual(len([method for method, _ in self.sent if method == 'POST']), 1)
+
+    def test_retry_preserves_both_sides_if_target_was_edited(self):
+        self.gateway.submit('org', 'original', PAYLOAD)
+        migrate_legacy(self.store)
+        account = self.imported()
+        Accounts(self.store).patch('org', 'admin', account['account_id'], account['revision'], {'name': 'User edit'})
+        self.legacy_writes_after_failed_upgrade()
+        with self.store.connect() as db:
+            before = '\n'.join(db.iterdump())
+        for operation in (lambda: migrate_legacy(self.store),
+                          lambda: resolve_legacy_proxies(self.store, None, '', None)):
+            with self.assertRaisesRegex(ValueError, '^legacy_migration_reconciliation_required$'):
+                operation()
+        with self.store.connect() as db:
+            self.assertEqual(before, '\n'.join(db.iterdump()))
+
+    def test_retry_proxy_failure_rolls_back_projection_cleanup(self):
+        self.gateway.submit('org', 'original', PAYLOAD)
+        migrate_legacy(self.store)
+        self.legacy_writes_after_failed_upgrade()
+        with self.store.connect() as db:
+            before = '\n'.join(db.iterdump())
+        with self.assertRaisesRegex(ValueError, '^legacy_proxy_mapping_required$'):
+            migrate_legacy(self.store, legacy_proxy_configured=True)
+        with self.store.connect() as db:
+            self.assertEqual(before, '\n'.join(db.iterdump()))
+
+    def test_missing_checkpoint_never_assumes_successful_import(self):
+        migrate_legacy(self.store)
+        with self.store.connect() as db:
+            db.execute("DELETE FROM channel_metadata WHERE name='legacy_source_digest'")
+        with self.assertRaisesRegex(ValueError, '^legacy_migration_checkpoint_missing$'):
+            migrate_legacy(self.store)
 
 
 if __name__ == '__main__':

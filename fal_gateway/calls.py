@@ -9,6 +9,7 @@ from datetime import datetime, UTC
 
 from .accounts import Accounts
 from .store import Conflict, now
+from .proxy import proxy_reference
 
 
 def amount(value):
@@ -49,6 +50,10 @@ class Calls:
                 db.execute('ALTER TABLE channel_calls ADD COLUMN finished_at TEXT')
             if 'reservation_unknown' not in columns:
                 db.execute('ALTER TABLE channel_calls ADD COLUMN reservation_unknown INTEGER NOT NULL DEFAULT 0')
+            if 'proxy_json' not in columns:
+                # Pre-proxy native calls were explicit-direct only. Legacy calls
+                # retain their original submissions/transport recovery path.
+                db.execute("ALTER TABLE channel_calls ADD COLUMN proxy_json TEXT NOT NULL DEFAULT '{\"mode\":\"direct\"}'")
 
     @staticmethod
     def project(row):
@@ -176,8 +181,7 @@ class Calls:
                 raise Conflict('account_disabled')
             if account['authorization_state'] != 'active':
                 raise Conflict('authorization_not_verified')
-            if json.loads(account['proxy_json']) != {'mode': 'direct'}:
-                raise Conflict('proxy_unavailable')
+            proxy = proxy_reference(json.loads(account['proxy_json']))
             # All keys sharing a quota subject share the same locked accounting boundary.
             peers = db.execute('SELECT registration_json FROM channel_accounts WHERE organization_id=? AND quota_subject_id=?',
                                (organization, account['quota_subject_id'])).fetchall()
@@ -203,10 +207,10 @@ class Calls:
             call_id, timestamp = str(uuid.uuid4()), now()
             db.execute('''INSERT INTO channel_calls
                 (id,organization_id,caller_id,operation_id,digest,task_id,account_id,credential_version,
-                 quota_subject_id,model_id,state,reservation_amount,created_at,updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,'acceptance_unknown',?,?,?)''',
+                 quota_subject_id,model_id,state,reservation_amount,created_at,updated_at,proxy_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,'acceptance_unknown',?,?,?,?)''',
                 (call_id, organization, caller, operation, digest, task, account['id'],
-                 account['credential_version'], account['quota_subject_id'], model, ceiling, timestamp, timestamp))
+                 account['credential_version'], account['quota_subject_id'], model, ceiling, timestamp, timestamp, json.dumps(proxy)))
             return dict(db.execute('SELECT * FROM channel_calls WHERE id=?', (call_id,)).fetchone()), True
 
     def credential(self, row):

@@ -135,7 +135,7 @@ class AccountTest(unittest.TestCase):
         created = self.create().json()
         account = created['account_id']
 
-        def check(_):
+        def check(_, **_connection):
             Accounts(self.store).patch('org-a', 'operator', account, 1, {'status': 'disabled'})
             return 'active'
 

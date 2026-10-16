@@ -1,6 +1,7 @@
 name: fal.ai Channel
 
 on:
+  workflow_dispatch:
   push:
     branches: [release]
     paths:
@@ -20,6 +21,7 @@ env:
   VERSION: 0.2.0
 jobs:
   build:
+    if: github.ref == 'refs/heads/release'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
