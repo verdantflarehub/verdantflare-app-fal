@@ -2,7 +2,10 @@
 import json
 import hashlib
 import hmac
+import os
+import sqlite3
 import uuid
+from contextlib import closing
 from urllib.parse import urlsplit, unquote
 
 from .store import now
@@ -69,6 +72,57 @@ def resolve_legacy_proxies(store, network, legacy_url, reference):
     except Exception:
         raise ValueError('legacy_proxy_mapping_unverified') from None
     return {organization: dict(reference) for organization in organizations}
+
+
+def backup_legacy(store):
+    """Called under execution_owner, before cutover or accepting new requests."""
+    with store.connect() as source:
+        if source.execute("SELECT 1 FROM channel_metadata WHERE name='accounts_cutover'").fetchone() and not retry_required(source, store):
+            return None
+        if not any(source.execute('SELECT 1 FROM ' + table + ' LIMIT 1').fetchone() for table in LEGACY_TABLES):
+            return None
+        expected = fingerprint(source, store, LEGACY_TABLES)
+        directory = store.path.parent / 'backups'
+        if directory.is_symlink():
+            raise ValueError('legacy_backup_unavailable')
+        directory.mkdir(mode=0o700, exist_ok=True)
+        destination = directory / ('channel-precutover-' + expected + '.sqlite3')
+
+        def verify(path):
+            if path.is_symlink() or not path.is_file():
+                raise ValueError('legacy_backup_unavailable')
+            with closing(sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True)) as check:
+                if check.execute('PRAGMA integrity_check').fetchone()[0] != 'ok' or fingerprint(check, store, LEGACY_TABLES) != expected:
+                    raise ValueError('legacy_backup_mismatch')
+
+        if destination.exists():
+            verify(destination)
+            return destination
+        temporary = directory / ('.precutover-' + uuid.uuid4().hex + '.sqlite3')
+        try:
+            with temporary.open('xb'):
+                pass
+            os.chmod(temporary, 0o600)
+            with closing(sqlite3.connect(temporary)) as copy:
+                source.backup(copy)
+            verify(temporary)
+            if fingerprint(source, store, LEGACY_TABLES) != expected:
+                raise ValueError('legacy_backup_source_changed')
+            with temporary.open('r+b') as saved:
+                os.fsync(saved.fileno())
+            try:
+                os.link(temporary, destination)
+            except FileExistsError:
+                verify(destination)
+            if os.name != 'nt':
+                descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(descriptor)
+                finally:
+                    os.close(descriptor)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return destination
 
 
 def migrate_legacy(store, *, legacy_proxy_configured=False, legacy_proxies=None):

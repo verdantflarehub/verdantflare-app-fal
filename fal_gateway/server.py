@@ -25,7 +25,7 @@ from .store import Conflict, Store
 from .accounts import Accounts
 from .calls import Calls
 from .ownership import execution_owner
-from .migration import migrate_legacy, resolve_legacy_proxies
+from .migration import backup_legacy, migrate_legacy, resolve_legacy_proxies
 from .activity import activity, ActivityUnavailable
 from .proxy import NetworkProxies, ProxyUnavailable, proxy_reference
 
@@ -326,6 +326,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
         gateway = Gateway(Store(os.environ.get("FAL_STATE_DB", "/data/fal/state.sqlite3"),
                                 os.environ["FAL_ENCRYPTION_KEY"]), network=network)
         try:
+            backup_legacy(gateway.store)
             legacy_url = next((os.environ[name] for name in ('https_proxy', 'HTTPS_PROXY', 'all_proxy', 'ALL_PROXY') if os.environ.get(name)), '')
             reference = json.loads(os.environ['FAL_LEGACY_PROXY_REFERENCE']) if os.environ.get('FAL_LEGACY_PROXY_REFERENCE') else None
             mappings = resolve_legacy_proxies(gateway.store, network, legacy_url, reference)
