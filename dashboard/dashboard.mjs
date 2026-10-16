@@ -3,7 +3,7 @@ const $=s=>document.querySelector(s);
 const esc=v=>String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const usd=v=>v==null?'未知':`${esc(v)} USD`;
 const authLabels={pending_verification:'待验证',active:'已验证',invalid:'授权失效',unavailable:'检查暂不可用'};
-const states={acceptance_unknown:'受理待确认',queued:'排队中',in_queue:'排队中',in_progress:'生成中',completed:'已完成',failed:'失败',rejected:'未受理'};
+const states={acceptance_unknown:'受理待确认',queued:'已提交',in_queue:'排队中',in_progress:'生成中',completed:'已完成',failed:'失败',rejected:'未受理'};
 let accounts=[],page='',editor=null,search='',filter='all',offset=0,total=0,logs=null;
 let accountFilter='',fromDate='',toDate='',media='';
 let proxyItems=[],proxyLoadError=false;
@@ -37,6 +37,17 @@ async function load(){if(disposed||!visible||editor||busy)return;clearTimeout(ti
  }catch(e){if(e.name!=='AbortError'&&!disposed&&visible&&current===generation){readFailures++;notice(readFailures<=3?'读取失败，已保留上次数据，稍后重试。':'读取失败，自动重试已停止。已保留上次数据。');const retry=document.createElement('button');retry.dataset.reload='';retry.textContent='重试';$('#message').append(retry);}}
  if(!disposed&&visible&&!editor&&current===generation&&readFailures<=3)timer=setTimeout(load,readFailures?5000*2**(readFailures-1)*(.85+Math.random()*.3):30000);}
 async function navigate(path){await sdk.navigation.request({target:'app',path});}
+async function refreshLog(button){
+ const pending=(logs?.items||[]).filter(r=>!['completed','failed','rejected'].includes(r.state));
+ if(!pending.length){await load();return;}
+ const current=generation;busy=true;clearTimeout(timer);button.disabled=true;button.textContent='刷新中…';let message='';
+ try{const result=await call('POST','/calls/refresh',{call_ids:pending.slice(0,16).map(r=>r.call_id)});
+  message=result.unavailable?`${result.unavailable} 条上游状态暂未确认，已保留原记录。`:'任务状态已更新。';
+  if(pending.length>16)message+=' 当前页其余任务可再次刷新。';
+ }catch(e){message='状态查询未完成，已保留原记录；可再次刷新。';}
+ finally{busy=false;if(button.isConnected){button.disabled=false;button.textContent='刷新';}}
+ if(!disposed&&visible&&generation===current){await load();notice(message);}
+}
 async function route(value){controller?.abort();clearTimeout(timer);++generation;readFailures=0;
  if(!editor)views.set(page,{search,filter,offset,accountFilter,fromDate,toDate,media,scroll:window.scrollY});
  const path=value?.path||'/',match=path.match(/^\/accounts\/(new|[0-9a-f-]+)(?:\/edit)?$/);editor=match?match[1]:null;page=path==='/log'?'log':'';
@@ -65,7 +76,7 @@ else{const context=sdk.context.get(),identity=c=>[c.stationId,c.installationId,c
   if(el.dataset.route!==undefined){e.preventDefault();await navigate(el.dataset.route);}if(el.hasAttribute('data-new')){returnFocus='[data-new]';await navigate('/accounts/new');}if(el.hasAttribute('data-cancel'))await navigate('/');
   if(el.dataset.edit){returnFocus=`[data-edit="${el.dataset.edit}"]`;await navigate(`/accounts/${el.dataset.edit}/edit`);}if(el.dataset.update)await mutate('update',el.dataset.update);if(el.dataset.toggle)await mutate('toggle',el.dataset.toggle);
   if(el.dataset.delete){deleting=el.dataset.delete;$('#archive-dialog').showModal();}if(el.hasAttribute('data-close'))$('#archive-dialog').close();if(el.id==='confirm-archive'){$('#archive-dialog').close();await mutate('delete',deleting);}
-  if(el.hasAttribute('data-reload')){readFailures=0;await load();}if(el.hasAttribute('data-prev')){offset=Math.max(0,offset-50);await load();}if(el.hasAttribute('data-next')){offset+=50;await load();}
+  if(el.hasAttribute('data-reload')){readFailures=0;if(page==='log'&&logs)await refreshLog(el);else await load();}if(el.hasAttribute('data-prev')){offset=Math.max(0,offset-50);await load();}if(el.hasAttribute('data-next')){offset+=50;await load();}
  },{signal:events.signal});
  window.addEventListener('offline',()=>notice('网络已断开，表单内容已保留。恢复连接后请手动保存。'),{signal:events.signal});
  const observer=new ResizeObserver(resize);observer.observe($('#app'));subscriptions.push(()=>observer.disconnect());bridge.ready();void route(sdk.navigation.get());}

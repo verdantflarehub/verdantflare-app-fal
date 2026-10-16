@@ -340,6 +340,31 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
     assets = DashboardAssets(dashboard_path) if dashboard_path.exists() else None
     accounts = Accounts(gateway.store)
     refreshes = {}
+    log_refreshes = {}
+    status_slots = asyncio.Semaphore(4)
+
+    def observe_call(item):
+        response = gateway._remote(item, gateway.calls.credential(item), False, timeout=2)
+        gateway.calls.observed(item['id'], 'failed' if response.get('failed') else response['state'])
+
+    async def refresh_calls(items):
+        async def observe(item):
+            if item['state'] in {'completed', 'failed', 'rejected'} or not item['provider_request_id']:
+                return 'unchanged'
+            async with status_slots:
+                try:
+                    await run_in_threadpool(observe_call, item)
+                    return 'refreshed'
+                except (APIError, ValueError, KeyError):
+                    return 'unavailable'
+        results = await asyncio.gather(*(observe(item) for item in items))
+        return {'schema_version': 1, **{name: results.count(name) for name in ('refreshed', 'unchanged', 'unavailable')}}
+
+    def finish_log_refresh(key, task):
+        if log_refreshes.get(key) is task:
+            log_refreshes.pop(key)
+        if not task.cancelled():
+            task.exception()
 
     def finish_refresh(identity_key, finished):
         if refreshes.get(identity_key) is finished:
@@ -376,6 +401,21 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                 return Response(data, headers={"Content-Type": mime, "Cache-Control": "no-store",
                                                "X-Content-Type-Options": "nosniff"})
             org = authenticate(request, management_token, manage=True)
+            if path == '/v1/calls/refresh':
+                data = await body(request)
+                ids = data.get('call_ids')
+                if set(data) != {'call_ids'} or not isinstance(ids, list) or not 1 <= len(ids) <= 16:
+                    raise APIError('invalid_refresh_request')
+                if any(not isinstance(value, str) or str(uuid.UUID(value)) != value for value in ids) or len(set(ids)) != len(ids):
+                    raise APIError('invalid_refresh_request')
+                items = [gateway.calls.get(org, identity) for identity in ids]
+                identity_key = (org, tuple(sorted(ids)))
+                task = log_refreshes.get(identity_key)
+                if task is None:
+                    task = asyncio.create_task(refresh_calls(items))
+                    log_refreshes[identity_key] = task
+                    task.add_done_callback(lambda finished, key=identity_key: finish_log_refresh(key, finished))
+                return respond(await asyncio.shield(task))
             if path == '/v1/proxies':
                 if gateway.network is None:
                     return respond({'schema_version': 1, 'items': []})
@@ -545,6 +585,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
         Route("/internal/dashboard/{asset:path}", manage),
         Route('/v1/calls', manage),
         Route('/v1/calls/search', manage, methods=['POST']),
+        Route('/v1/calls/refresh', manage, methods=['POST']),
         Route('/v1/accounts/search', manage, methods=['POST']),
         Route("/v1/accounts", manage, methods=["GET", "POST"]),
         Route("/v1/accounts/{account_id:uuid}", manage, methods=["GET", "PATCH", "DELETE"]),
