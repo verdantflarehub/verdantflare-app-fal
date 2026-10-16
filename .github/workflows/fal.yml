@@ -1,0 +1,93 @@
+name: fal.ai Channel
+
+on:
+  push:
+    branches: [release]
+    paths:
+      - fal_gateway/**
+      - dashboard/**
+      - Dockerfile
+      - .dockerignore
+      - pyproject.toml
+      - .github/workflows/fal.yml
+permissions:
+  contents: read
+concurrency:
+  group: video-fal-gateway-release
+  cancel-in-progress: false
+env:
+  SERVICE: video-fal-gateway
+  VERSION: 0.2.0
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - id: image
+        env:
+          REGISTRY_ENDPOINT: ${{ secrets.REGISTRY_ENDPOINT_ALIYUN }}
+        run: |
+          set -euo pipefail
+          registry_endpoint="${REGISTRY_ENDPOINT%/}"
+          test -n "${registry_endpoint}"
+          echo "registry_endpoint=${registry_endpoint}" >> "$GITHUB_OUTPUT"
+          echo "name=${registry_endpoint}/wod/verdantflare-app" >> "$GITHUB_OUTPUT"
+          echo "version=${SERVICE}-v${VERSION}" >> "$GITHUB_OUTPUT"
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ steps.image.outputs.registry_endpoint }}
+          username: ${{ secrets.REGISTRY_USER_ALIYUN }}
+          password: ${{ secrets.REGISTRY_PASSWORD_ALIYUN }}
+      - name: Refuse an existing image tag
+        run: |
+          set -euo pipefail
+          if docker buildx imagetools inspect "${{ steps.image.outputs.name }}:${{ steps.image.outputs.version }}" > /tmp/image-inspect.log 2>&1; then
+            echo "Refusing to overwrite an existing release"
+            exit 1
+          fi
+          grep -Eqi 'manifest unknown|not found' /tmp/image-inspect.log || { echo "Registry preflight failed"; exit 1; }
+      - uses: docker/build-push-action@v6
+        id: publish
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          sbom: false
+          tags: ${{ steps.image.outputs.name }}:${{ steps.image.outputs.version }}
+          cache-from: type=gha,scope=${{ env.SERVICE }}
+          cache-to: type=gha,mode=max,scope=${{ env.SERVICE }}
+      - name: Extract published Dashboard bytes
+        env:
+          APP_IMAGE: ${{ steps.image.outputs.name }}:${{ steps.image.outputs.version }}
+          APP_IMAGE_DIGEST: ${{ steps.publish.outputs.digest }}
+          APP_IMAGE_NAME: ${{ steps.image.outputs.name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dashboard-release
+          docker pull "${APP_IMAGE_NAME}@${APP_IMAGE_DIGEST}"
+          extract_container=$(docker create "${APP_IMAGE_NAME}@${APP_IMAGE_DIGEST}")
+          trap 'docker rm "$extract_container" >/dev/null' EXIT
+          docker cp "${extract_container}:/app/dashboard" dashboard-release/dashboard
+          python - <<'PY'
+          import hashlib, json, os, pathlib
+          root = pathlib.Path('dashboard-release')
+          declaration = json.loads((root / 'dashboard/dashboard-declaration.json').read_bytes())
+          if declaration['appId'] != 'fal' or declaration['appVersion'] != os.environ['VERSION']:
+              raise SystemExit('Dashboard version mismatch')
+          files = {p.relative_to(root).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
+                   for p in sorted(root.rglob('*')) if p.is_file()}
+          release = dict(schemaVersion=1, appId='fal', appVersion=os.environ['VERSION'],
+                         sourceCommit=os.environ['GITHUB_SHA'], actionsRunId=os.environ['GITHUB_RUN_ID'],
+                         actionsRunAttempt=os.environ['GITHUB_RUN_ATTEMPT'], appImage=os.environ['APP_IMAGE'],
+                         appImageDigest=os.environ['APP_IMAGE_DIGEST'], files=files)
+          (root / 'release.json').write_text(json.dumps(release, sort_keys=True, indent=2) + '\n', encoding='utf-8')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fal-dashboard-v${{ env.VERSION }}
+          path: dashboard-release/
+          if-no-files-found: error
+          retention-days: 30

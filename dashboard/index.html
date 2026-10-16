@@ -1,0 +1,10 @@
+<!doctype html>
+<html lang="zh-CN" data-embedded="true">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>fal.ai · 渠道管理</title><link rel="stylesheet" href="./dashboard.css"></head>
+<body data-embedded="true"><main class="viewport" id="app">
+<div class="topline"><div class="brand"><div class="mark">F</div><div><h1>fal.ai</h1><p class="subtitle">API Key 渠道 · 按调用计费</p></div></div></div>
+<nav class="tabs" aria-label="fal.ai 页面"><a href="#/apps/fal/" data-route="/">概览</a><a href="#/apps/fal/log" data-route="/log">日志</a></nav>
+<div id="message" class="vf-banner" role="status" hidden></div><div id="content" aria-live="polite"></div></main>
+<dialog id="archive-dialog" aria-labelledby="archive-title"><h2 id="archive-title">删除这个账号？</h2><p>停止新调用，历史日志和原任务恢复信息仍保留。</p><div class="actions"><button data-close>取消</button><button id="confirm-archive" class="danger">确认删除</button></div></dialog>
+<script type="module" src="./dashboard.mjs"></script></body></html>
