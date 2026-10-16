@@ -58,10 +58,9 @@ class Calls:
     @staticmethod
     def project(row):
         row = dict(row)
+        # finished_at is when we observed completion, not the supplier's finish
+        # time. Delayed polling must never become a fabricated generation duration.
         elapsed = None
-        if row.get('finished_at'):
-            elapsed = max(0, int((datetime.fromisoformat(row['finished_at']) -
-                                  datetime.fromisoformat(row['created_at'])).total_seconds()))
         return {'schema_version': 1, 'call_id': row['id'], 'task_id': row['task_id'],
                 'account_id': row['account_id'], 'model_id': row['model_id'],
                 'account_name': row.get('account_name'), 'account_status': row.get('account_status'),

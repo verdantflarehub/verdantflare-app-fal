@@ -189,8 +189,8 @@ class CallsTest(unittest.TestCase):
         after = self.gateway.calls.get('org', item['call_id'])
         self.assertEqual(first, after)
         projected = self.gateway.calls.project(after)
-        self.assertIsNotNone(projected['duration_seconds'])
-        self.assertEqual(projected['duration_source'], 'local_elapsed')
+        self.assertIsNone(projected['duration_seconds'])
+        self.assertEqual(projected['duration_source'], 'unknown')
         self.assertIsNone(projected['settlement']['amount'])
 
 
