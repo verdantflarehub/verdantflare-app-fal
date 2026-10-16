@@ -25,6 +25,7 @@ from .accounts import Accounts
 from .calls import Calls
 from .ownership import execution_owner
 from .migration import migrate_legacy
+from .activity import activity, ActivityUnavailable
 
 MODEL = "minimax/h3/reference-to-video"
 QUEUE = "https://queue.fal.run"
@@ -228,10 +229,10 @@ class Gateway:
             projected['video_url'] = response['video_url']
         return projected
 
-    def _remote(self, item, key, result):
+    def _remote(self, item, key, result, *, timeout=30):
         url = QUEUE + "/minimax/h3/requests/" + item["provider_request_id"] + ("" if result else "/status")
         try:
-            response = self.client.get(url, headers={"Authorization": "Key " + key}, timeout=30)
+            response = self.client.get(url, headers={"Authorization": "Key " + key}, timeout=timeout)
         except httpx.HTTPError:
             raise APIError("provider_unavailable", 503) from None
         if response.status_code in {401, 403}:
@@ -305,6 +306,11 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                 return Response(data, headers={"Content-Type": mime, "Cache-Control": "no-store",
                                                "X-Content-Type-Options": "nosniff"})
             org = authenticate(request, management_token, manage=True)
+            if path == '/v1/activity':
+                try:
+                    return respond(await run_in_threadpool(activity, gateway))
+                except ActivityUnavailable:
+                    return respond({'error': 'activity_unavailable'}, 503)
             if path in {'/v1/calls', '/v1/calls/search'}:
                 query = await filters(request, {'account_id', 'state', 'search', 'offset', 'limit',
                                                 'media', 'created_from', 'created_before'})
@@ -445,7 +451,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
     async def health(request):
         return respond({"service": "video-fal-gateway", "version": __version__, "status": "ok"})
 
-    management = Starlette(routes=[Route("/health", health),
+    management = Starlette(routes=[Route("/health", health), Route('/v1/activity', manage),
         Route("/internal/dashboard-declaration", manage), Route("/internal/dashboard-index", manage),
         Route("/internal/dashboard/{asset:path}", manage),
         Route('/v1/calls', manage),
