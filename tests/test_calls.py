@@ -9,7 +9,7 @@ from starlette.testclient import TestClient
 
 from fal_gateway.accounts import Accounts
 from fal_gateway.calls import Calls, amount
-from fal_gateway.server import Gateway, MODEL, create_apps
+from fal_gateway.server import Gateway, MODEL, SD2_MODEL, create_apps
 from fal_gateway.store import Conflict, Store
 from test_gateway import PAYLOAD, MANAGE, EXECUTE, KEY
 
@@ -31,7 +31,9 @@ class CallsTest(unittest.TestCase):
                 if self.mode == 'reject':
                     return httpx.Response(429)
                 return httpx.Response(200, json={'request_id': 'original-request'})
-            return httpx.Response(200, json={'status': 'COMPLETED'})
+            if request.url.path.endswith('/status'):
+                return httpx.Response(200, json={'status': 'COMPLETED'})
+            return httpx.Response(200, json={'video': {'url': 'https://files.fal.media/example.mp4'}})
 
         self.gateway = Gateway(self.store, httpx.Client(transport=httpx.MockTransport(upstream)))
         _, execution = create_apps(self.gateway, MANAGE, EXECUTE)
@@ -72,6 +74,21 @@ class CallsTest(unittest.TestCase):
         self.assertEqual(observed.status_code, 200)
         self.assertEqual(observed.json()['state'], 'completed')
         self.assertEqual(len([x for x in self.sent if x[0] == 'POST']), 1)
+
+    def test_seedance_uses_fixed_endpoint_and_recovers_by_original_model(self):
+        payload = {'prompt': '@Image1: one ice cube falls into a glass', 'duration': 5,
+                   'resolution': '720p', 'aspect_ratio': '16:9', 'generate_audio': True,
+                   'image_urls': ['data:image/webp;base64,AAAA']}
+        response = self.submit('seedance', model_id=SD2_MODEL, payload=payload)
+        self.assertEqual(response.status_code, 200)
+        call_id = response.json()['call_id']
+        stored = self.gateway.calls.get('org', call_id, 'video-mcp')
+        self.assertEqual(stored['model_id'], SD2_MODEL)
+        self.assertEqual(stored['reservation_amount'], '6')
+        self.assertEqual(self.client.get('/v1/calls/' + call_id, headers=self.headers).json()['state'], 'completed')
+        self.assertEqual(self.client.get('/v1/calls/' + call_id + '/result', headers=self.headers).status_code, 200)
+        self.assertEqual(self.submit('invalid', model_id='other/model', payload=payload).status_code, 400)
+        self.assertEqual(self.submit('invalid', model_id=SD2_MODEL, payload={**payload, 'url': 'https://example.com'}).status_code, 400)
 
     def test_pinned_credentials_survive_rotation_and_archival(self):
         first = self.submit()

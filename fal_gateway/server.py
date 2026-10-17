@@ -31,6 +31,9 @@ from .activity import activity, ActivityUnavailable
 from .proxy import NetworkProxies, ProxyUnavailable, proxy_reference
 
 MODEL = "minimax/h3/reference-to-video"
+SD2_MODEL = "bytedance/seedance-2.0/reference-to-video"
+CALL_MODELS = {MODEL, SD2_MODEL}
+REQUEST_PATHS = {MODEL: "minimax/h3", SD2_MODEL: SD2_MODEL}
 QUEUE = "https://queue.fal.run"
 CHECK = "https://api.fal.ai/v1/models/requests/by-endpoint"
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -184,7 +187,33 @@ class Gateway:
             return "unavailable"
 
     @staticmethod
-    def validate_payload(value) -> dict:
+    def validate_payload(value, model=MODEL) -> dict:
+        if model == SD2_MODEL:
+            fields = {"prompt", "duration", "resolution", "aspect_ratio", "generate_audio",
+                      "image_urls", "video_urls", "audio_urls"}
+            if not isinstance(value, dict) or not value or set(value) - fields:
+                raise APIError("invalid_payload")
+            if not isinstance(value.get("prompt"), str) or not value["prompt"].strip():
+                raise APIError("invalid_payload")
+            number(value.get("duration"), 4, 15)
+            if (value.get("resolution") not in {"480p", "720p"}
+                    or value.get("aspect_ratio") not in {"16:9", "9:16", "1:1", "4:3", "3:4", "21:9"}
+                    or value.get("generate_audio") is not True):
+                raise APIError("unsupported_profile")
+            for field, limit, prefix in (("image_urls", 9, "data:image/"),
+                                         ("video_urls", 3, "data:video/"),
+                                         ("audio_urls", 3, "data:audio/")):
+                refs = value.get(field, [])
+                if not isinstance(refs, list) or len(refs) > limit or any(
+                        not isinstance(item, str) or not item.startswith(prefix) for item in refs):
+                    raise APIError("invalid_payload")
+            if not value.get("image_urls") and not value.get("video_urls"):
+                raise APIError("reference_required")
+            if sum(len(value.get(field, [])) for field in ("image_urls", "video_urls", "audio_urls")) > 12:
+                raise APIError("invalid_payload")
+            return value
+        if model != MODEL:
+            raise APIError("capability_not_supported")
         if not isinstance(value, dict) or not value or set(value) - PAYLOAD_FIELDS:
             raise APIError("invalid_payload")
         if not isinstance(value.get("prompt"), str) or not value["prompt"].strip():
@@ -250,14 +279,14 @@ class Gateway:
             self.calls.observed(submission_id, 'failed' if response.get('failed') else response['state'])
         return response
 
-    def submit_call(self, org, caller, operation, task, payload, account, ceiling):
-        item, fresh = self.calls.reserve(org, caller, operation, task, MODEL, payload, account, ceiling)
+    def submit_call(self, org, caller, operation, task, payload, account, ceiling, model=MODEL):
+        item, fresh = self.calls.reserve(org, caller, operation, task, model, payload, account, ceiling)
         if not fresh:
             return self.calls.project(item)
         key = self.calls.credential(item)
         try:
             with self.transport(org, json.loads(item['proxy_json'])) as client:
-                response = client.post(QUEUE + '/' + MODEL, json=payload,
+                response = client.post(QUEUE + '/' + model, json=payload,
                                        headers={'Authorization': 'Key ' + key}, timeout=60)
         except ProxyUnavailable:
             # Resolution failed before any supplier request was made.
@@ -289,7 +318,10 @@ class Gateway:
         return projected
 
     def _remote(self, item, key, result, *, timeout=30, legacy=False):
-        url = QUEUE + "/minimax/h3/requests/" + item["provider_request_id"] + ("" if result else "/status")
+        model = item.get("model_id", MODEL)
+        if model not in REQUEST_PATHS:
+            raise APIError("capability_not_supported")
+        url = QUEUE + "/" + REQUEST_PATHS[model] + "/requests/" + item["provider_request_id"] + ("" if result else "/status")
         try:
             with self.transport(item['organization_id'], json.loads(item.get('proxy_json', '{"mode":"direct"}')), legacy=legacy) as client:
                 response = client.get(url, headers={"Authorization": "Key " + key}, timeout=timeout)
@@ -545,7 +577,8 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                 caller = identity(request.headers.get('x-caller-id', ''))
                 if request.method == 'POST':
                     data = await body(request, 96 * 1024 * 1024)
-                    if data.get('model_id') != MODEL or data.get('capability') != 'video':
+                    model = data.get('model_id')
+                    if not isinstance(model, str) or model not in CALL_MODELS or data.get('capability') != 'video':
                         raise APIError('capability_not_supported')
                     operation = identity(data.get('idempotency_key', ''))
                     task = identity(data.get('task_id', ''))
@@ -555,9 +588,9 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                             account = str(uuid.UUID(account))
                         except (ValueError, TypeError, AttributeError):
                             raise APIError('invalid_account') from None
-                    payload = gateway.validate_payload(data.get('payload'))
+                    payload = gateway.validate_payload(data.get('payload'), model)
                     return respond(await run_in_threadpool(gateway.submit_call, org, caller, operation,
-                        task, payload, account, data.get('budget_limit')))
+                        task, payload, account, data.get('budget_limit'), model))
                 if 'operation_id' in request.path_params:
                     return respond(gateway.calls.by_operation(org, caller, request.path_params['operation_id']))
                 return respond(await run_in_threadpool(gateway.remote_call, org, caller,
