@@ -1,6 +1,6 @@
 [project]
 name = "verdantflare-video-fal-gateway"
-version = "0.2.6"
+version = "0.2.7"
 requires-python = ">=3.11"
 dependencies = ["starlette==0.48.0", "uvicorn==0.40.0", "httpx==0.28.1", "socksio==1.0.0", "cryptography==46.0.3"]
 

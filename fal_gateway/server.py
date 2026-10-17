@@ -33,7 +33,7 @@ from .proxy import NetworkProxies, ProxyUnavailable, proxy_reference
 MODEL = "minimax/h3/reference-to-video"
 SD2_MODEL = "bytedance/seedance-2.0/reference-to-video"
 CALL_MODELS = {MODEL, SD2_MODEL}
-REQUEST_PATHS = {MODEL: "minimax/h3", SD2_MODEL: SD2_MODEL}
+REQUEST_PATHS = {MODEL: "minimax/h3", SD2_MODEL: "bytedance/seedance-2.0"}
 QUEUE = "https://queue.fal.run"
 CHECK = "https://api.fal.ai/v1/models/requests/by-endpoint"
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
