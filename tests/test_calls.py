@@ -21,10 +21,12 @@ class CallsTest(unittest.TestCase):
         self.store = Store(str(Path(self.temp.name) / 'state.sqlite3'), self.key)
         self.accounts = Accounts(self.store)
         self.sent = []
+        self.urls = []
         self.mode = 'success'
 
         def upstream(request):
             self.sent.append((request.method, request.headers.get('authorization')))
+            self.urls.append(str(request.url))
             if request.method == 'POST':
                 if self.mode == 'timeout':
                     raise httpx.ReadTimeout('mock interruption', request=request)
@@ -85,8 +87,11 @@ class CallsTest(unittest.TestCase):
         stored = self.gateway.calls.get('org', call_id, 'video-mcp')
         self.assertEqual(stored['model_id'], SD2_MODEL)
         self.assertEqual(stored['reservation_amount'], '6')
+        self.assertTrue(self.urls[-1].endswith('/bytedance/seedance-2.0/reference-to-video'))
         self.assertEqual(self.client.get('/v1/calls/' + call_id, headers=self.headers).json()['state'], 'completed')
+        self.assertTrue(self.urls[-1].endswith('/bytedance/seedance-2.0/reference-to-video/requests/original-request/status'))
         self.assertEqual(self.client.get('/v1/calls/' + call_id + '/result', headers=self.headers).status_code, 200)
+        self.assertTrue(self.urls[-1].endswith('/bytedance/seedance-2.0/reference-to-video/requests/original-request'))
         self.assertEqual(self.submit('invalid', model_id='other/model', payload=payload).status_code, 400)
         self.assertEqual(self.submit('invalid', model_id=SD2_MODEL, payload={**payload, 'url': 'https://example.com'}).status_code, 400)
 
