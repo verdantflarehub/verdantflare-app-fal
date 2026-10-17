@@ -1,0 +1,25 @@
+import assert from 'node:assert/strict';
+import {readFileSync} from 'node:fs';
+import vm from 'node:vm';
+const context=vm.createContext({window:{},document:{querySelector:()=>({})},AbortController,clearTimeout(){},setTimeout(){return 1;}});
+vm.runInContext(readFileSync(new URL('../dashboard/dashboard.mjs',import.meta.url),'utf8'),context);
+const run=code=>vm.runInContext(code,context);
+run("proxyItems=[{proxy_id:'id',revision:4,name:'Weyland',status:'active'}]");
+assert.equal(run("proxyLabel({proxy:'none'})"),'不使用');
+assert.equal(run("proxyLabel({proxy:'id',proxyRevision:4})"),'Weyland');
+assert.equal(run("proxyLabel({proxy:'id',proxyRevision:3})"),'Weyland（配置已变更）');
+run("proxyItems=[];proxyLoadError=true");
+assert.equal(run("proxyLabel({proxy:'id',proxyRevision:4})"),'代理信息暂不可用');
+console.log('Proxy labels retain identity and expose unavailable or changed configuration');
+
+run("render=()=>{};notice=()=>{};accountView=a=>a;proxyItems=[];proxyLoadError=false");
+const requests=[];
+context.call=async(method,path)=>{requests.push(path);return path==='/proxies'?{items:[{proxy_id:'id',revision:4,name:'Weyland',status:'active'}]}:{items:[{id:'account',proxy:'id',proxyRevision:4}],total:1};};
+await run('load()');
+assert.deepEqual(requests,['/accounts/search','/proxies']);
+assert.equal(run('proxyLabel(accounts[0])'),'Weyland');
+context.call=async(method,path)=>{if(path==='/proxies')throw new Error('offline');return {items:[{id:'account',proxy:'id',proxyRevision:4}],total:1};};
+await run('load()');
+assert.equal(run('accounts.length'),1);
+assert.equal(run('proxyLabel(accounts[0])'),'代理信息暂不可用');
+console.log('Overview loads authorized proxy names; proxy outage preserves account data');
