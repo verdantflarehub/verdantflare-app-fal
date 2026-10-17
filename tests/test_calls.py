@@ -56,6 +56,23 @@ class CallsTest(unittest.TestCase):
             'idempotency_key': operation, 'task_id': 'task', 'model_id': MODEL,
             'capability': 'video', 'payload': PAYLOAD, 'budget_limit': '6', **extra})
 
+    def test_draining_rejects_both_submission_paths_but_keeps_original_reads(self):
+        first = self.submit().json()
+        before = list(self.sent)
+        self.gateway.accepting = False
+        for response in [self.submit('new'), self.client.post('/v1/submissions',
+                headers=self.headers, json={'operation_id': 'legacy-new', 'model_id': MODEL, 'payload': PAYLOAD})]:
+            self.assertEqual(response.status_code, 503)
+            self.assertFalse(response.json()['accepted'])
+            self.assertEqual(response.json()['state'], 'rejected')
+        self.assertEqual(self.sent, before)
+        recovered = self.client.get('/v1/calls/by-idempotency/op', headers=self.headers)
+        self.assertEqual(recovered.json()['call_id'], first['call_id'])
+        observed = self.client.get('/v1/calls/' + first['call_id'], headers=self.headers)
+        self.assertEqual(observed.status_code, 200)
+        self.assertEqual(observed.json()['state'], 'completed')
+        self.assertEqual(len([x for x in self.sent if x[0] == 'POST']), 1)
+
     def test_pinned_credentials_survive_rotation_and_archival(self):
         first = self.submit()
         self.assertEqual(first.status_code, 200)

@@ -25,6 +25,7 @@ from .store import Conflict, Store
 from .accounts import Accounts
 from .calls import Calls
 from .ownership import execution_owner
+from .discovery_lifecycle import configured_publisher, PublicationLifetime, serve_owned_servers
 from .migration import backup_legacy, migrate_legacy, resolve_legacy_proxies
 from .activity import activity, ActivityUnavailable
 from .proxy import NetworkProxies, ProxyUnavailable, proxy_reference
@@ -112,6 +113,7 @@ def authenticate(request: Request, token: str, *, manage: bool) -> str:
 class Gateway:
     def __init__(self, store: Store, client: httpx.Client | None = None, *, network=None):
         self.store = store
+        self.accepting = True
         self.calls = Calls(store)
         # Explicit direct accounts never inherit deployment or host proxies.
         self.client = client or httpx.Client(follow_redirects=False, timeout=20, trust_env=False)
@@ -536,6 +538,9 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
     async def execute(request: Request):
         try:
             org = authenticate(request, execution_token, manage=False)
+            if request.method == 'POST' and not gateway.accepting:
+                return respond({'error': 'channel_unavailable', 'schema_version': 1,
+                                'accepted': False, 'state': 'rejected'}, 503)
             if request.url.path.startswith('/v1/calls'):
                 caller = identity(request.headers.get('x-caller-id', ''))
                 if request.method == 'POST':
@@ -601,15 +606,45 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
         Route('/v1/calls/{call_id:uuid}/result', execute),
         Route("/v1/submissions/{submission_id:uuid}", execute),
         Route("/v1/submissions/{submission_id:uuid}/result", execute)])
+    management.state.gateway = gateway
     return management, execution
 
 
 async def main():
     with execution_owner(os.environ.get('FAL_STATE_DB', '/data/fal/state.sqlite3')):
         management, execution = create_apps()
-        servers = [uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, access_log=False))
-                   for app, port in ((management, 8000), (execution, 8001))]
-        await asyncio.gather(*(server.serve() for server in servers))
+        gateway = management.state.gateway
+        lifetime = None
+        publication_task = None
+        try:
+            publisher = configured_publisher(os.environ, gateway.store, __version__)
+
+            class ChannelServer(uvicorn.Server):
+                def handle_exit(self, sig, frame):
+                    gateway.accepting = False
+                    if lifetime:
+                        lifetime.begin_draining()
+                    super().handle_exit(sig, frame)
+                    for server in servers:
+                        server.should_exit = True
+                        server.force_exit = self.force_exit
+
+            servers = [ChannelServer(uvicorn.Config(app, host="0.0.0.0", port=port, access_log=False))
+                       for app, port in ((management, 8000), (execution, 8001))]
+            if publisher:
+                lifetime = PublicationLifetime(publisher, servers, lambda value: setattr(gateway, 'accepting', value))
+                publication_task = asyncio.create_task(lifetime.run())
+            def begin_draining():
+                gateway.accepting = False
+                if lifetime:
+                    lifetime.begin_draining()
+            await serve_owned_servers(servers, begin_draining)
+        finally:
+            try:
+                if lifetime:
+                    await lifetime.finish(publication_task)
+            finally:
+                gateway.close()
 
 
 if __name__ == "__main__":
