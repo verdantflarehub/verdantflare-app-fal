@@ -1,5 +1,5 @@
 
-    :root {
+    html {
       color-scheme: light;
       --vf-surface-0: #eef2ef;
       --vf-surface-1: rgba(229, 235, 229, .92);
@@ -43,7 +43,7 @@
       --vf-shimmer-grad: linear-gradient(105deg, transparent 20%, color-mix(in srgb, var(--accent) 8%, transparent) 48%, color-mix(in srgb, var(--accent) 14%, transparent) 52%, transparent 80%)
     }
 
-    :root[data-theme=dark] {
+    html[data-theme=dark] {
       color-scheme: dark;
       --vf-surface-0: #111310;
       --vf-surface-1: #141613;
@@ -634,7 +634,7 @@
       background: var(--vf-scrim, rgba(21, 35, 30, .3))
     }
 
-    :root[data-theme=dark] dialog::backdrop {
+    html[data-theme=dark] dialog::backdrop {
       background: var(--vf-scrim, rgba(0, 0, 0, .55))
     }
 
@@ -1027,28 +1027,28 @@
 
     /* ---- Interaction-physics audit fixes (shared across channel prototypes) ---- */
     @media (min-resolution: 2dppx) {
-      :root {
+      html {
         --vf-ring-hairline: .5px
       }
     }
 
     @media (min-resolution: 3dppx) {
-      :root {
+      html {
         --vf-ring-hairline: calc(1px / 3)
       }
     }
 
-    :root[data-theme=dark] :is(h1, .mark) {
+    html[data-theme=dark] :is(h1, .mark) {
       font-weight: 660;
       font-variation-settings: "wght" 660
     }
 
-    :root[data-theme=dark] :is(h2, h3, .big, .tabs a[aria-current=page], details.card > summary, .vf-banner b) {
+    html[data-theme=dark] :is(h2, h3, .big, .tabs a[aria-current=page], details.card > summary, .vf-banner b) {
       font-weight: 560;
       font-variation-settings: "wght" 560
     }
 
-    :root[data-theme=dark] :is(th, td strong, .ledger-summary b, .g-account-money strong, .task-title, .breadcrumb a) {
+    html[data-theme=dark] :is(th, td strong, .ledger-summary b, .g-account-money strong, .task-title, .breadcrumb a) {
       font-weight: 465;
       font-variation-settings: "wght" 465
     }
