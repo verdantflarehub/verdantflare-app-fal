@@ -1308,3 +1308,15 @@
   overflow-wrap: normal;
 }
 .log-table td.num, .log-table td:first-child { font-variant-numeric: tabular-nums; }
+
+/* v0.2 精简新增：账号要点网格、状态标签、分页 */
+.c-facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
+.c-facts small { display: block; }
+.c-facts .sub { margin-top: 6px; }
+@media (max-width: 900px) { .c-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 520px) { .c-facts { grid-template-columns: 1fr; } }
+.account-status { margin-left: 8px; }
+.c-pager { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 12px; }
+.c-check { display: flex; gap: 8px; align-items: center; }
+.c-check input { width: auto; }
+.card > h3 + .subline + button { margin-top: 12px; }
