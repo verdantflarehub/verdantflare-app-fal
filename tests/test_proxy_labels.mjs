@@ -26,8 +26,10 @@ const index=readFileSync(new URL('../dashboard/index.html',import.meta.url),'utf
 const css=readFileSync(new URL('../dashboard/dashboard.css',import.meta.url),'utf8');
 const formHtml=run("editor='new'; form()");
 assert.ok(index.indexOf('id="appBreadcrumb"')<index.indexOf('class="topline"'));
-assert.match(index,/data:image\/png;base64,/);
+assert.match(index,/#ED0648/);
+assert.doesNotMatch(index,/渠道管理<\/span>/);
 assert.match(css,/\.viewport\s*\{[^}]*max-width:\s*none/);
+assert.match(css,/\.viewport\s*\{[^}]*padding:\s*0/);
 assert.match(css,/\.g-form\s*\{[^}]*max-width:\s*none/);
 assert.doesNotMatch(formHtml,/data-cancel|>返回概览<|>取消</);
 console.log('Overview loads authorized proxy names; proxy outage preserves account data');
