@@ -1,5 +1,4 @@
-
-    html {
+html {
       color-scheme: light;
       --vf-surface-0: #eef2ef;
       --vf-surface-1: rgba(229, 235, 229, .92);
@@ -189,9 +188,35 @@
     }
 
     .viewport {
-      max-width: 1440px;
-      margin: auto;
+      width: 100%;
+      max-width: none;
+      min-width: 0;
+      margin: 0;
       padding: 30px 36px 48px
+    }
+
+    .breadcrumb {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 14px;
+      flex-wrap: wrap
+    }
+
+    .breadcrumb a {
+      color: var(--muted);
+      transition: color var(--vf-dur-base) var(--vf-ease-out)
+    }
+
+    .breadcrumb a:hover {
+      color: var(--accent)
+    }
+
+    .breadcrumb [aria-current=page] {
+      color: var(--ink);
+      font-weight: 600
     }
 
     .topline,
@@ -228,10 +253,12 @@
       width: 44px;
       height: 44px;
       border-radius: 12px;
-      color: var(--accent);
-      background: var(--accent-soft);
+      color: var(--ink);
+      background: var(--panel);
+      box-shadow: var(--vf-shadow-card);
       font-weight: 700;
-      font-size: 20px
+      font-size: 20px;
+      flex: none
     }
 
     .title-line {
@@ -690,7 +717,7 @@
       display: none !important
     }
 
-    @media(max-width:900px) {
+    @media(max-width:920px) {
       .viewport {
         padding: 22px
       }
@@ -848,7 +875,8 @@
     }
 
     .g-form {
-      max-width: 900px;
+      width: 100%;
+      max-width: none;
       display: grid;
       gap: 20px
     }
@@ -987,43 +1015,13 @@
         flex-wrap: wrap
       }
     }
-
-    .g-icon-button {
-      width: 36px;
-      height: 36px;
-      min-width: 36px;
-      padding: 0;
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-    }
-
-    .g-icon-button svg {
-      width: 18px;
-      height: 18px;
-      pointer-events: none;
-    }
-
-    .g-icon-button:focus-visible {
-      outline: 2px solid var(--accent);
-      outline-offset: 3px;
-    }
-
-    .g-icon-button[aria-busy="true"] svg {
-      animation: g-icon-spin 1s linear infinite;
-    }
-
-    @keyframes g-icon-spin {
-      to {
-        transform: rotate(360deg);
-      }
-    }
-
-    @media (prefers-reduced-motion: reduce) {
-      .g-icon-button[aria-busy="true"] svg {
-        animation: none;
-      }
-    }
+  .g-icon-button { width: 36px; height: 36px; min-width: 36px; padding: 0; display: inline-flex; align-items: center; justify-content: center; }
+.g-icon-button svg { width: 18px; height: 18px; pointer-events: none; }
+.g-icon-button:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.g-icon-button[aria-busy="true"] svg { animation: g-icon-spin 1s linear infinite; }
+@keyframes g-icon-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .g-icon-button[aria-busy="true"] svg { animation: none; } }
+.c-membership { grid-template-columns: repeat(4,minmax(0,1fr)); } .c-gateway { border-top:1px solid var(--line); padding-top:16px; margin-top:16px; } .c-gateway summary { cursor:pointer; color:var(--muted); font-size:12px; } @media(max-width:920px){.c-membership{grid-template-columns:repeat(2,minmax(0,1fr));}} @media(max-width:520px){.c-membership{grid-template-columns:1fr;}}
 
     /* ---- Interaction-physics audit fixes (shared across channel prototypes) ---- */
     @media (min-resolution: 2dppx) {
@@ -1209,10 +1207,6 @@
       border-top: 0;
       background: var(--subtle)
     }
-      .budget-tooltip { position: relative; display: inline-flex; align-items: center; gap: 5px; cursor: help; outline-offset: 4px; }
-    .budget-tooltip [role="tooltip"] { display: none; position: absolute; top: calc(100% + 6px); right: 0; z-index: 5; padding: 7px 10px; border-radius: 6px; background: var(--ink); color: var(--bg); font-size: 12px; font-weight: 400; white-space: nowrap; box-shadow: var(--vf-shadow-popover); }
-    .budget-tooltip:hover [role="tooltip"], .budget-tooltip:focus [role="tooltip"] { display: block; }
-
 
     /* ---- T1 gap closure: surfaces, status lights, touch-grow, icon baseline ---- */
     dialog {
@@ -1273,6 +1267,17 @@
     :where(p, small, span, td, a, label, h2, h3)>svg:not(.gauge) {
       vertical-align: -.125em
     }
+      .budget-tooltip { position: relative; display: inline-flex; align-items: center; gap: 5px; cursor: help; outline-offset: 4px; }
+    .budget-tooltip [role="tooltip"] { display: none; position: absolute; top: calc(100% + 6px); right: 0; z-index: 5; padding: 7px 10px; border-radius: 6px; background: var(--ink); color: var(--bg); font-size: 12px; font-weight: 400; white-space: nowrap; box-shadow: var(--vf-shadow-popover); }
+    .budget-tooltip:hover [role="tooltip"], .budget-tooltip:focus [role="tooltip"] { display: block; }
+
+.mark > svg,
+.mark > img {
+  width: 26px;
+  height: 26px;
+  object-fit: contain;
+  display: block;
+}
 
 /* Keep complete task/model identifiers readable without squeezing status or money. */
 .log-filters {
@@ -1313,10 +1318,13 @@
 .c-facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 16px; }
 .c-facts small { display: block; }
 .c-facts .sub { margin-top: 6px; }
-@media (max-width: 900px) { .c-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width:920px) { .c-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 520px) { .c-facts { grid-template-columns: 1fr; } }
 .account-status { margin-left: 8px; }
 .c-pager { display: flex; gap: 8px; align-items: center; justify-content: flex-end; margin-top: 12px; }
 .c-check { display: flex; gap: 8px; align-items: center; }
 .c-check input { width: auto; }
 .card > h3 + .subline + button { margin-top: 12px; }
+.card { border: 0.5px solid var(--vf-border-default, var(--line)); box-shadow: var(--vf-shadow-card, 0 1px 2px rgba(20, 20, 19, .04)); }
+
+.viewport{width:100%;max-width:none;min-width:0;margin:0}.g-form{width:100%;max-width:none}

@@ -22,4 +22,13 @@ context.call=async(method,path)=>{if(path==='/proxies')throw new Error('offline'
 await run('load()');
 assert.equal(run('accounts.length'),1);
 assert.equal(run('proxyLabel(accounts[0])'),'代理信息暂不可用');
+const index=readFileSync(new URL('../dashboard/index.html',import.meta.url),'utf8');
+const css=readFileSync(new URL('../dashboard/dashboard.css',import.meta.url),'utf8');
+const formHtml=run("editor='new'; form()");
+assert.ok(index.indexOf('id="appBreadcrumb"')<index.indexOf('class="topline"'));
+assert.match(index,/data:image\/png;base64,/);
+assert.match(css,/\.viewport\s*\{[^}]*max-width:\s*none/);
+assert.match(css,/\.g-form\s*\{[^}]*max-width:\s*none/);
+assert.doesNotMatch(formHtml,/data-cancel|>返回概览<|>取消</);
 console.log('Overview loads authorized proxy names; proxy outage preserves account data');
+

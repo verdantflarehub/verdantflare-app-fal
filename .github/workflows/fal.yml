@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 env:
   SERVICE: video-fal-gateway
-  VERSION: 0.2.10
+  VERSION: 0.2.11
 jobs:
   build:
     if: github.ref == 'refs/heads/release'
