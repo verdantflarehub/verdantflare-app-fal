@@ -3,6 +3,7 @@ import asyncio
 import logging
 
 from .discovery import Config, DiscoveryError, Publisher
+from .capabilities import load_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -15,10 +16,18 @@ def configured_publisher(env, store, version):
     if not endpoint or not scope:
         raise ValueError('incomplete_discovery_configuration')
     config = Config(endpoint, scope, env.get('ETCD_USERNAME', ''), env.get('ETCD_PASSWORD', ''))
-    return Publisher(config, store, version, [{
-        'capability_id': capability, 'adapter_version': '1',
-        'execution_state': 'adapter_connected_unverified'}
-        for capability in ('video.generate.reference',)])
+    metadata_path = env.get('CHANNEL_METADATA_FILE')
+    if metadata_path:
+        capabilities = [{
+            'capability_id': item['capability_id'], 'adapter_version': '1',
+            'execution_state': item['execution_state']}
+            for item in load_metadata(metadata_path)['capabilities']]
+    else:
+        # Existing deployments keep their original discovery fact until the
+        # versioned Chart declaration is mounted alongside the new image.
+        capabilities = [{'capability_id': 'video.generate.reference',
+                         'adapter_version': '1', 'execution_state': 'adapter_connected_unverified'}]
+    return Publisher(config, store, version, capabilities)
 
 
 class PublicationLifetime:

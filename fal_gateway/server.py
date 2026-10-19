@@ -29,6 +29,7 @@ from .discovery_lifecycle import configured_publisher, PublicationLifetime, serv
 from .migration import backup_legacy, migrate_legacy, resolve_legacy_proxies
 from .activity import activity, ActivityUnavailable
 from .proxy import NetworkProxies, ProxyUnavailable, proxy_reference
+from .capabilities import load_metadata
 
 MODEL = "minimax/h3/reference-to-video"
 SD2_MODEL = "bytedance/seedance-2.0/reference-to-video"
@@ -354,6 +355,8 @@ class Gateway:
 
 def create_apps(gateway: Gateway | None = None, management_token: str | None = None,
                 execution_token: str | None = None):
+    metadata_path = os.environ.get("CHANNEL_METADATA_FILE")
+    channel_metadata = load_metadata(metadata_path) if metadata_path else None
     if gateway is None:
         origin, token = os.environ.get('FAL_NETWORK_URL', ''), os.environ.get('FAL_NETWORK_TOKEN', '')
         network = NetworkProxies(origin, token) if origin or token else None
@@ -569,6 +572,16 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
 
     async def execute(request: Request):
         try:
+            if request.url.path == '/v1/capabilities' and request.method == 'GET':
+                auth = request.headers.getlist('authorization')
+                if (len(execution_token) < 32 or len(auth) != 1
+                        or not hmac.compare_digest(auth[0], 'Bearer ' + execution_token)):
+                    raise APIError('unauthorized', 401)
+                if request.headers.get('x-caller-id') != 'video-mcp':
+                    raise APIError('forbidden', 403)
+                if channel_metadata is None:
+                    raise APIError('capabilities_unavailable', 503)
+                return respond(channel_metadata)
             org = authenticate(request, execution_token, manage=False)
             if request.method == 'POST' and not gateway.accepting:
                 return respond({'error': 'channel_unavailable', 'schema_version': 1,
@@ -633,6 +646,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
         Route("/v1/authorization/check", manage, methods=["POST"]),
         Route("/v1/limits", manage, methods=["GET", "PUT"]), Route("/v1/usage", manage)])
     execution = Starlette(routes=[Route("/health", health), Route("/v1/submissions", execute, methods=["POST"]),
+        Route('/v1/capabilities', execute, methods=['GET']),
         Route('/v1/calls', execute, methods=['POST']),
         Route('/v1/calls/by-idempotency/{operation_id}', execute),
         Route('/v1/calls/{call_id:uuid}', execute),
