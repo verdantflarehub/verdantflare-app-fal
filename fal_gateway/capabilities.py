@@ -53,7 +53,8 @@ def load_metadata(path: str | Path) -> dict:
     seen_ids, seen_endpoints = set(), set()
     required = {"capability_id", "type", "model_id", "endpoint_id", "display_name",
                 "operation", "parameter_schema", "execution_state"}
-    optional = {"protocol", "output_resolutions", "source_url"}
+    optional = {"protocol", "output_resolutions", "source_url", "card_group",
+                "card_title", "input_summary", "output_summary"}
     for item in items:
         if not isinstance(item, dict) or not required <= set(item) or set(item) - required - optional:
             raise ValueError("channel_metadata_entry")
@@ -88,8 +89,21 @@ def load_metadata(path: str | Path) -> dict:
             if not isinstance(item["source_url"], str):
                 raise ValueError("channel_metadata_source")
             url = urlsplit(item["source_url"])
-            if (url.scheme != "https" or url.hostname != "fal.ai" or url.username or url.password
-                    or url.query or url.fragment or url.path != "/models/" + endpoint + "/api"):
+            expected = {"/models/" + endpoint + "/api"}
+            if model == "minimax/h3":
+                expected.add("/minimax-h3")
+            if (url.scheme != "https" or url.hostname != "fal.ai" or url.port not in {None, 443}
+                    or url.username or url.password
+                    or url.query or url.fragment or url.path not in expected):
                 raise ValueError("channel_metadata_source")
+        card_fields = {"card_group", "card_title", "input_summary", "output_summary"}
+        if card_fields.intersection(item) and not card_fields <= set(item):
+            raise ValueError("channel_metadata_card_incomplete")
+        if card_fields <= set(item):
+            if (not isinstance(item["card_group"], str)
+                    or not _IDENTIFIER.fullmatch(item["card_group"])
+                    or any(not isinstance(item[field], str) or not 1 <= len(item[field]) <= 160
+                           for field in ("card_title", "input_summary", "output_summary"))):
+                raise ValueError("channel_metadata_card")
     return {"schema_version": 1, "channel_id": "fal", "version": hashlib.sha256(raw).hexdigest(),
             "capabilities": copy.deepcopy(items)}

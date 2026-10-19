@@ -75,3 +75,24 @@ class CapabilitiesTests(unittest.TestCase):
         self.write()
         with self.assertRaisesRegex(ValueError, 'source'):
             load_metadata(self.path)
+
+    def test_card_presentation_is_declared_but_does_not_enable_execution(self):
+        item = self.data['capabilities'][0]
+        item.update(card_group='camera-controls', card_title='镜头控制',
+                    input_summary='图像 · 相机轨迹', output_summary='视频')
+        self.write()
+        loaded = load_metadata(self.path)
+        self.assertEqual(loaded['capabilities'][0]['card_title'], '镜头控制')
+        self.assertEqual(loaded['capabilities'][0]['execution_state'], 'catalog_only')
+        del item['output_summary']
+        self.write()
+        with self.assertRaisesRegex(ValueError, 'card_incomplete'):
+            load_metadata(self.path)
+
+    def test_h3_official_page_is_allowed_only_for_h3(self):
+        item = self.data['capabilities'][0]
+        item.update(model_id='minimax/h3', endpoint_id='minimax/h3/text-to-video',
+                    source_url='https://fal.ai/minimax-h3')
+        self.write()
+        self.assertEqual(load_metadata(self.path)['capabilities'][0]['source_url'],
+                         'https://fal.ai/minimax-h3')
