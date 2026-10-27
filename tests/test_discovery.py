@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from cryptography.fernet import Fernet
 import httpx
@@ -173,6 +174,24 @@ class PublicationTests(unittest.TestCase):
                        {'CHANNEL_DISCOVERY_SCOPE_ID': 'scope', 'CHANNEL_DISCOVERY_ETCD_URL': self.config.endpoint}):
             with self.assertRaises(ValueError):
                 configured_publisher(values, self.store, '0.1.4')
+
+    def test_execution_url_uses_installed_service_configuration(self):
+        values = {'CHANNEL_DISCOVERY_SCOPE_ID': 'installation-scope',
+                  'CHANNEL_DISCOVERY_ETCD_URL': self.config.endpoint,
+                  'ETCD_USERNAME': 'synthetic', 'ETCD_PASSWORD': 'synthetic',
+                  'CHANNEL_DISCOVERY_EXECUTION_URL': 'http://fal-custom.workspace.svc.cluster.local:8001'}
+        with patch('fal_gateway.discovery_lifecycle.Publisher') as publisher:
+            configured_publisher(values, self.store, '0.2.16')
+            config = publisher.call_args.args[0]
+            self.assertEqual(config.execution_url, values['CHANNEL_DISCOVERY_EXECUTION_URL'])
+            self.assertEqual(config.scope, 'installation-scope')
+            values.pop('CHANNEL_DISCOVERY_EXECUTION_URL')
+            configured_publisher(values, self.store, '0.2.16')
+            self.assertEqual(publisher.call_args.args[0].execution_url, 'http://fal-channel.verdantflare-app.svc.cluster.local:8001')
+        for url in ('https://public.invalid:8001', 'http://fal.workspace.svc.cluster.local:8001/path',
+                    'http://user:secret@fal.workspace.svc.cluster.local:8001', 'http://fal.workspace.svc.cluster.local:8001?token=secret'):
+            with self.subTest(url=url), self.assertRaises(ValueError):
+                Config(self.config.endpoint, 'scope', 'synthetic', 'synthetic', execution_url=url)
 
 
 class LifetimeTests(unittest.IsolatedAsyncioTestCase):

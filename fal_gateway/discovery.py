@@ -42,7 +42,7 @@ class Config:
     username: str = field(repr=False)
     password: str = field(repr=False)
     channel: str = 'fal'
-    execution_url: str = 'http://video-fal-gateway.verdantflare-video.svc.cluster.local:8001'
+    execution_url: str = 'http://fal-channel.verdantflare-app.svc.cluster.local:8001'
 
     def __post_init__(self):
         if (not IDENTITY.fullmatch(self.scope) or self.channel != 'fal'
@@ -56,7 +56,15 @@ class Config:
                      and parsed.path in ('', '/') and not parsed.query and not parsed.fragment)
         except ValueError:
             valid = False
-        if not valid or self.execution_url != 'http://video-fal-gateway.verdantflare-video.svc.cluster.local:8001':
+        execution = urlsplit(self.execution_url)
+        try:
+            execution_valid = (execution.scheme in ('http', 'https') and execution.hostname
+                and re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.svc\.cluster\.local', execution.hostname)
+                and execution.port == 8001 and not execution.username and not execution.password
+                and execution.path in ('', '/') and not execution.query and not execution.fragment)
+        except ValueError:
+            execution_valid = False
+        if not valid or not execution_valid:
             raise ValueError('invalid_discovery_configuration')
 
     @property

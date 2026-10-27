@@ -618,6 +618,26 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                     raise APIError('capabilities_unavailable', 503)
                 return respond(channel_metadata)
             org = authenticate(request, execution_token, manage=False)
+            if request.url.path == '/v1/video-preflight':
+                if request.headers.get('x-caller-id') != 'video-mcp':
+                    raise APIError('forbidden', 403)
+                data = await body(request, 96 * 1024 * 1024)
+                if (set(data) - {'model_id', 'payload', 'account_id', 'budget_limit'}
+                        or not isinstance(data.get('model_id'), str)
+                        or data['model_id'] not in CALL_MODELS or 'payload' not in data):
+                    raise APIError('invalid_request')
+                account = data.get('account_id')
+                if account is not None:
+                    try:
+                        account = str(uuid.UUID(account))
+                    except (ValueError, TypeError, AttributeError):
+                        raise APIError('invalid_request') from None
+                payload = gateway.validate_payload(data['payload'], data['model_id'])
+                result = await run_in_threadpool(gateway.calls.preflight, org, data['model_id'],
+                                                 payload, account, data.get('budget_limit'))
+                if not gateway.accepting:
+                    result.update(can_submit=False, blocked_reason='channel_unavailable')
+                return respond(result)
             if request.url.path == '/v1/cost':
                 if request.headers.get('x-caller-id') != 'video-mcp':
                     raise APIError('forbidden', 403)
@@ -695,6 +715,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
     execution = Starlette(routes=[Route("/health", health), Route("/v1/submissions", execute, methods=["POST"]),
         Route('/v1/capabilities', execute, methods=['GET']),
         Route('/v1/cost', execute, methods=['POST']),
+        Route('/v1/video-preflight', execute, methods=['POST']),
         Route('/v1/calls', execute, methods=['POST']),
         Route('/v1/calls/by-idempotency/{operation_id}', execute),
         Route('/v1/calls/{call_id:uuid}', execute),

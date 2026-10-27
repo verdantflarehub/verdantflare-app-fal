@@ -15,7 +15,9 @@ def configured_publisher(env, store, version):
         return None
     if not endpoint or not scope:
         raise ValueError('incomplete_discovery_configuration')
-    config = Config(endpoint, scope, env.get('ETCD_USERNAME', ''), env.get('ETCD_PASSWORD', ''))
+    config = Config(endpoint, scope, env.get('ETCD_USERNAME', ''), env.get('ETCD_PASSWORD', ''),
+                    execution_url=env.get('CHANNEL_DISCOVERY_EXECUTION_URL',
+                        'http://fal-channel.verdantflare-app.svc.cluster.local:8001'))
     metadata_path = env.get('CHANNEL_METADATA_FILE')
     if metadata_path:
         capabilities = [{

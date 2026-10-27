@@ -166,6 +166,44 @@ class Calls:
                 'summary': {'task_count': len(amounts), 'budget': total('budget_amount'),
                             'settlement': total('settlement_amount')}}
 
+    @staticmethod
+    def _admit(db, organization, account_id, ceiling):
+        if account_id:
+            account = Accounts.row(db, organization, account_id)
+        else:
+            account = db.execute('SELECT * FROM channel_accounts WHERE organization_id=? AND is_default=1',
+                                 (organization,)).fetchone()
+        if account is None:
+            raise Conflict('account_required')
+        if account['status'] != 'active':
+            raise Conflict('account_disabled')
+        if account['authorization_state'] != 'active':
+            raise Conflict('authorization_not_verified')
+        proxy = proxy_reference(json.loads(account['proxy_json']))
+        # All keys sharing a quota subject share the same locked accounting boundary.
+        peers = db.execute('SELECT registration_json FROM channel_accounts WHERE organization_id=? AND quota_subject_id=?',
+                           (organization, account['quota_subject_id'])).fetchall()
+        limits = [Decimal(data['budget_limit']) for peer in peers
+                  if (data := json.loads(peer['registration_json'])).get('budget_limit') is not None]
+        daily_limits = [data['daily_limit'] for peer in peers
+                        if (data := json.loads(peer['registration_json'])).get('daily_limit') is not None]
+        if daily_limits:
+            count = db.execute('SELECT COUNT(*) FROM channel_calls WHERE organization_id=? AND '
+                               'quota_subject_id=? AND created_at>=?',
+                               (organization, account['quota_subject_id'], datetime.now(UTC).date().isoformat())).fetchone()[0]
+            if count >= min(daily_limits):
+                raise Conflict('daily_limit_reached')
+        charges = db.execute('SELECT reservation_amount,settlement_amount,reservation_unknown FROM channel_calls '
+                             'WHERE organization_id=? AND quota_subject_id=?',
+                             (organization, account['quota_subject_id'])).fetchall()
+        if limits and any(row['reservation_unknown'] and row['settlement_amount'] is None for row in charges):
+            raise Conflict('historical_cost_unknown')
+        committed = sum((Decimal(row['settlement_amount']) if row['settlement_amount'] is not None
+                         else Decimal(row['reservation_amount']) for row in charges), Decimal(0))
+        if limits and committed + Decimal(ceiling) > min(limits):
+            raise Conflict('budget_exceeded')
+        return account, proxy
+
     def reserve(self, organization, caller, operation, task, model, payload, account_id, ceiling):
         # A ceiling is a reservation, never a fabricated preflight estimate or settlement.
         if ceiling is None:
@@ -191,40 +229,7 @@ class Calls:
             estimated = billing['estimate']['amount']
             if estimated is not None and Decimal(estimated) > Decimal(ceiling):
                 raise Conflict('budget_below_estimate')
-            if account_id:
-                account = Accounts.row(db, organization, account_id)
-            else:
-                account = db.execute('SELECT * FROM channel_accounts WHERE organization_id=? AND is_default=1',
-                                     (organization,)).fetchone()
-            if account is None:
-                raise Conflict('account_required')
-            if account['status'] != 'active':
-                raise Conflict('account_disabled')
-            if account['authorization_state'] != 'active':
-                raise Conflict('authorization_not_verified')
-            proxy = proxy_reference(json.loads(account['proxy_json']))
-            # All keys sharing a quota subject share the same locked accounting boundary.
-            peers = db.execute('SELECT registration_json FROM channel_accounts WHERE organization_id=? AND quota_subject_id=?',
-                               (organization, account['quota_subject_id'])).fetchall()
-            limits = [Decimal(data['budget_limit']) for peer in peers
-                      if (data := json.loads(peer['registration_json'])).get('budget_limit') is not None]
-            daily_limits = [data['daily_limit'] for peer in peers
-                            if (data := json.loads(peer['registration_json'])).get('daily_limit') is not None]
-            if daily_limits:
-                count = db.execute('SELECT COUNT(*) FROM channel_calls WHERE organization_id=? AND '
-                                   'quota_subject_id=? AND created_at>=?',
-                                   (organization, account['quota_subject_id'], datetime.now(UTC).date().isoformat())).fetchone()[0]
-                if count >= min(daily_limits):
-                    raise Conflict('daily_limit_reached')
-            charges = db.execute('SELECT reservation_amount,settlement_amount,reservation_unknown FROM channel_calls '
-                                 'WHERE organization_id=? AND quota_subject_id=?',
-                                 (organization, account['quota_subject_id'])).fetchall()
-            if limits and any(row['reservation_unknown'] and row['settlement_amount'] is None for row in charges):
-                raise Conflict('historical_cost_unknown')
-            committed = sum((Decimal(row['settlement_amount']) if row['settlement_amount'] is not None
-                             else Decimal(row['reservation_amount']) for row in charges), Decimal(0))
-            if limits and committed + Decimal(ceiling) > min(limits):
-                raise Conflict('budget_exceeded')
+            account, proxy = self._admit(db, organization, account_id, ceiling)
             call_id, timestamp = str(uuid.uuid4()), now()
             db.execute('''INSERT INTO channel_calls
                 (id,organization_id,caller_id,operation_id,digest,task_id,account_id,credential_version,
@@ -234,6 +239,30 @@ class Calls:
                  account['credential_version'], account['quota_subject_id'], model, ceiling, timestamp, timestamp,
                  json.dumps(proxy), estimated, json.dumps(billing)))
             return dict(db.execute('SELECT * FROM channel_calls WHERE id=?', (call_id,)).fetchone()), True
+
+    def preflight(self, organization, model, payload, account_id, ceiling):
+        billing = estimate(model, payload)
+        result = {'schema_version': 1, 'channel_id': 'fal', 'model_id': model,
+                  'can_submit': False, 'blocked_reason': None, 'pricing': billing,
+                  'observed_at': now(), 'account_id': None,
+                  'admission_scope': 'local_account_ledger; rechecked_on_create'}
+        try:
+            if ceiling is None:
+                raise Conflict('cost_unknown')
+            ceiling = amount(ceiling)
+            if Decimal(ceiling) <= 0:
+                raise Conflict('cost_unknown')
+            estimated = billing['estimate']['amount']
+            if estimated is not None and Decimal(estimated) > Decimal(ceiling):
+                raise Conflict('budget_below_estimate')
+            with self.store.connect() as db:
+                db.execute('PRAGMA query_only=ON')
+                db.execute('BEGIN')
+                account, _ = self._admit(db, organization, account_id, ceiling)
+                result.update(can_submit=True, account_id=account['id'])
+        except Conflict as error:
+            result['blocked_reason'] = str(error)
+        return result
 
     def credential(self, row):
         # Recovery uses the pinned version even after account rotation, disabling or archival.
