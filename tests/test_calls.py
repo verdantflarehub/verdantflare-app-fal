@@ -99,7 +99,7 @@ class CallsTest(unittest.TestCase):
         first = self.submit()
         self.assertEqual(first.status_code, 200)
         self.assertTrue(first.json()['accepted'])
-        self.assertIsNone(first.json()['budget']['amount'])
+        self.assertEqual(first.json()['budget'], {'amount': '0.25', 'unit': 'USD', 'source': 'official_price_table'})
         rotated = self.accounts.checked('org', 'admin', self.account['account_id'],
             self.account['revision'], 'active', 'new-key-with-enough-length')
         self.accounts.patch('org', 'admin', rotated['account_id'], rotated['revision'], {}, archive=True)
@@ -164,9 +164,10 @@ class CallsTest(unittest.TestCase):
         logs = self.gateway.calls.list('org')
         self.assertEqual(logs['total'], 1)
         self.assertEqual(logs['summary']['task_count'], 1)
-        for field in ('budget', 'settlement'):
-            self.assertIsNone(logs['summary'][field]['amount'])
-            self.assertEqual(logs['summary'][field]['unknown_count'], 1)
+        self.assertEqual(logs['summary']['budget']['amount'], '0.25')
+        self.assertEqual(logs['summary']['budget']['unknown_count'], 0)
+        self.assertIsNone(logs['summary']['settlement']['amount'])
+        self.assertEqual(logs['summary']['settlement']['unknown_count'], 1)
         self.assertEqual(self.gateway.calls.list('org', state='failed')['total'], 0)
         self.assertEqual(self.gateway.calls.list('other')['items'], [])
         self.assertEqual(self.gateway.calls.list('org', search='missing')['items'], [])

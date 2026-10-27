@@ -30,6 +30,8 @@ from .migration import backup_legacy, migrate_legacy, resolve_legacy_proxies
 from .activity import activity, ActivityUnavailable
 from .proxy import NetworkProxies, ProxyUnavailable, proxy_reference
 from .capabilities import load_metadata
+from .billing import BillingError, estimate, fetch_bill
+from .errors import provider_failure, failure
 
 MODEL = "minimax/h3/reference-to-video"
 SD2_MODEL = "bytedance/seedance-2.0/reference-to-video"
@@ -46,8 +48,8 @@ ASPECT_RATIOS = {"adaptive", "21:9", "16:9", "4:3", "1:1", "3:4", "9:16"}
 
 
 class APIError(Exception):
-    def __init__(self, code: str, status: int = 400):
-        self.code, self.status = code, status
+    def __init__(self, code: str, status: int = 400, diagnostic=None):
+        self.code, self.status, self.diagnostic = code, status, diagnostic
 
 
 def respond(value: dict, status: int = 200):
@@ -277,7 +279,7 @@ class Gateway:
             return self._remote(item, key, result, legacy=True)
         else:
             response = self._remote({**item, 'proxy_json': imported['proxy_json']}, key, result)
-            self.calls.observed(submission_id, 'failed' if response.get('failed') else response['state'])
+            self.calls.observed(submission_id, 'failed' if response.get('failed') else response['state'], response.get('error'))
         return response
 
     def submit_call(self, org, caller, operation, task, payload, account, ceiling, model=MODEL):
@@ -291,13 +293,17 @@ class Gateway:
                                        headers={'Authorization': 'Key ' + key}, timeout=60)
         except ProxyUnavailable:
             # Resolution failed before any supplier request was made.
-            self.calls.rejected(item['id'])
+            self.calls.rejected(item['id'], failure('proxy_unavailable', accepted=False))
             raise APIError('proxy_unavailable', 503) from None
         except httpx.HTTPError:
             # Even a connection interruption is not evidence of upstream non-acceptance.
             return self.calls.project(item)
-        if response.status_code in {400, 401, 403, 404, 422, 429}:
-            self.calls.rejected(item['id'])
+        if response.status_code in {400, 401, 402, 403, 404, 422, 429}:
+            try:
+                error_body = response.json()
+            except ValueError:
+                error_body = None
+            self.calls.rejected(item['id'], provider_failure(error_body, response.status_code, accepted=False))
         elif response.is_success:
             try:
                 remote = response.json()['request_id']
@@ -312,11 +318,22 @@ class Gateway:
         if not item['provider_request_id']:
             return self.calls.project(item)
         response = self._remote(item, self.calls.credential(item), result)
-        self.calls.observed(call_id, 'failed' if response.get('failed') else response['state'])
+        self.calls.observed(call_id, 'failed' if response.get('failed') else response['state'], response.get('error'))
         projected = self.calls.project(self.calls.get(org, call_id, caller))
         if 'video_url' in response:
             projected['video_url'] = response['video_url']
         return projected
+
+    def refresh_settlement(self, org, actor, call_id, revision):
+        item = self.calls.get(org, call_id)
+        if item['revision'] != revision:
+            raise Conflict('revision_conflict')
+        try:
+            with self.transport(org, json.loads(item['proxy_json'])) as client:
+                bill = fetch_bill(client, self.calls.credential(item), item)
+        except ProxyUnavailable:
+            raise APIError('proxy_unavailable', 503) from None
+        return self.calls.settle_bill(item, actor, bill)
 
     def _remote(self, item, key, result, *, timeout=30, legacy=False):
         model = item.get("model_id", MODEL)
@@ -330,12 +347,20 @@ class Gateway:
             raise APIError('proxy_unavailable', 503) from None
         except httpx.HTTPError:
             raise APIError("provider_unavailable", 503) from None
-        if response.status_code in {401, 403}:
-            raise APIError("provider_auth_failed", 503)
         if not response.is_success:
-            raise APIError("provider_unavailable", 503)
+            try:
+                error_body = response.json()
+            except ValueError:
+                error_body = None
+            diagnostic = provider_failure(error_body, response.status_code, accepted=True)
+            raise APIError(diagnostic['code'], 429 if response.status_code == 429 else 503, diagnostic)
         try:
             data = response.json()
+            if not isinstance(data, dict):
+                raise ValueError
+            if data.get('error') or data.get('error_type'):
+                return {'id': item['id'], 'state': 'failed', 'failed': True,
+                        'error': provider_failure(data, accepted=True)}
             if result:
                 video = data["video"]["url"]
                 host = urlsplit(video).hostname if isinstance(video, str) else None
@@ -347,8 +372,9 @@ class Gateway:
             state = data["status"]
             if state not in {"IN_QUEUE", "IN_PROGRESS", "COMPLETED"}:
                 raise ValueError
+            failed = bool(data.get("error") or data.get("error_type"))
             return {"id": item["id"], "state": state.lower(), "metrics": data.get("metrics") if isinstance(data.get("metrics"), dict) else None,
-                    "failed": bool(data.get("error") or data.get("error_type"))}
+                    "failed": failed, "error": provider_failure(data, accepted=True) if failed else None}
         except (ValueError, KeyError, TypeError):
             raise APIError("provider_response_invalid", 503) from None
 
@@ -382,7 +408,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
 
     def observe_call(item):
         response = gateway._remote(item, gateway.calls.credential(item), False, timeout=2)
-        gateway.calls.observed(item['id'], 'failed' if response.get('failed') else response['state'])
+        gateway.calls.observed(item['id'], 'failed' if response.get('failed') else response['state'], response.get('error'))
 
     async def refresh_calls(items):
         async def observe(item):
@@ -438,6 +464,13 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                 return Response(data, headers={"Content-Type": mime, "Cache-Control": "no-store",
                                                "X-Content-Type-Options": "nosniff"})
             org = authenticate(request, management_token, manage=True)
+            if path.endswith('/settlement/refresh') and 'call_id' in request.path_params:
+                data = await body(request)
+                if set(data) != {'expected_revision'}:
+                    raise APIError('invalid_settlement_request')
+                revision = number(data['expected_revision'], 1, 2**31 - 1)
+                return respond(await run_in_threadpool(gateway.refresh_settlement, org,
+                    request.headers['x-user-id'], str(request.path_params['call_id']), revision))
             if path == '/v1/calls/refresh':
                 data = await body(request)
                 ids = data.get('call_ids')
@@ -561,12 +594,14 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                     number(data.get("daily_limit"), 0, 1000),
                     number(data.get("expected_revision"), 0, 2**31 - 1)))
             raise APIError("not_found", 404)
+        except BillingError as error:
+            return respond({'error': error.code}, error.status)
         except APIError as error:
-            return respond({"error": error.code}, error.status)
+            return respond({"error": error.code, **({'diagnostic': error.diagnostic} if error.diagnostic else {})}, error.status)
         except Conflict as error:
             return respond({"error": str(error)}, 409)
         except KeyError:
-            return respond({"error": "account_not_found"}, 404)
+            return respond({"error": "call_not_found" if '/calls/' in request.url.path else "account_not_found"}, 404)
         except ValueError:
             return respond({"error": "invalid_account_request"}, 400)
 
@@ -583,6 +618,15 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                     raise APIError('capabilities_unavailable', 503)
                 return respond(channel_metadata)
             org = authenticate(request, execution_token, manage=False)
+            if request.url.path == '/v1/cost':
+                if request.headers.get('x-caller-id') != 'video-mcp':
+                    raise APIError('forbidden', 403)
+                data = await body(request, 96 * 1024 * 1024)
+                if (set(data) != {'model_id', 'payload'} or not isinstance(data.get('model_id'), str)
+                        or data['model_id'] not in CALL_MODELS):
+                    raise APIError('invalid_request')
+                payload = gateway.validate_payload(data['payload'], data['model_id'])
+                return respond(estimate(data['model_id'], payload))
             if request.method == 'POST' and not gateway.accepting:
                 return respond({'error': 'channel_unavailable', 'schema_version': 1,
                                 'accepted': False, 'state': 'rejected'}, 503)
@@ -619,8 +663,10 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                 return respond(await run_in_threadpool(gateway.remote, org,
                     str(request.path_params["submission_id"]), request.url.path.endswith("/result")))
             raise APIError("not_found", 404)
+        except BillingError as error:
+            return respond({'error': error.code}, error.status)
         except APIError as error:
-            return respond({"error": error.code}, error.status)
+            return respond({"error": error.code, **({'diagnostic': error.diagnostic} if error.diagnostic else {})}, error.status)
         except Conflict as error:
             return respond({"error": str(error)}, 409)
         except KeyError:
@@ -637,6 +683,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
         Route('/v1/calls', manage),
         Route('/v1/calls/search', manage, methods=['POST']),
         Route('/v1/calls/refresh', manage, methods=['POST']),
+        Route('/v1/calls/{call_id:uuid}/settlement/refresh', manage, methods=['POST']),
         Route('/v1/accounts/search', manage, methods=['POST']),
         Route("/v1/accounts", manage, methods=["GET", "POST"]),
         Route("/v1/accounts/{account_id:uuid}", manage, methods=["GET", "PATCH", "DELETE"]),
@@ -647,6 +694,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
         Route("/v1/limits", manage, methods=["GET", "PUT"]), Route("/v1/usage", manage)])
     execution = Starlette(routes=[Route("/health", health), Route("/v1/submissions", execute, methods=["POST"]),
         Route('/v1/capabilities', execute, methods=['GET']),
+        Route('/v1/cost', execute, methods=['POST']),
         Route('/v1/calls', execute, methods=['POST']),
         Route('/v1/calls/by-idempotency/{operation_id}', execute),
         Route('/v1/calls/{call_id:uuid}', execute),

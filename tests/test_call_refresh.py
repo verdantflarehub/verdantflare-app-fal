@@ -36,7 +36,7 @@ class CallRefreshTest(unittest.TestCase):
         self.assertEqual(f.sent, [('GET', 'Key ' + KEY)])
         record = f.gateway.calls.get('org', call['call_id'])
         self.assertEqual(record['state'], 'completed')
-        self.assertIsNone(record['budget_amount'])
+        self.assertEqual(record['budget_amount'], '0.25')
         self.assertIsNone(record['settlement_amount'])
         self.assertEqual(self.refresh([call['call_id']]).json()['unchanged'], 1)
         self.assertEqual(len(f.sent), 1)

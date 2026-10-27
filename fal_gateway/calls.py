@@ -10,6 +10,7 @@ from datetime import datetime, UTC
 from .accounts import Accounts
 from .store import Conflict, now
 from .proxy import proxy_reference
+from .billing import estimate
 
 
 def amount(value):
@@ -44,6 +45,12 @@ class Calls:
                 );
                 CREATE INDEX IF NOT EXISTS channel_calls_quota
                   ON channel_calls(organization_id, quota_subject_id);
+                CREATE TABLE IF NOT EXISTS channel_call_settlements (
+                  call_id TEXT PRIMARY KEY, organization_id TEXT NOT NULL,
+                  actor TEXT NOT NULL, amount TEXT NOT NULL, source TEXT NOT NULL,
+                  evidence_digest TEXT NOT NULL, evidence_json TEXT NOT NULL,
+                  event_count INTEGER NOT NULL, observed_at TEXT NOT NULL
+                );
             ''')
             columns = {row['name'] for row in db.execute('PRAGMA table_info(channel_calls)')}
             if 'finished_at' not in columns:
@@ -54,6 +61,10 @@ class Calls:
                 # Pre-proxy native calls were explicit-direct only. Legacy calls
                 # retain their original submissions/transport recovery path.
                 db.execute("ALTER TABLE channel_calls ADD COLUMN proxy_json TEXT NOT NULL DEFAULT '{\"mode\":\"direct\"}'")
+            if 'billing_json' not in columns:
+                db.execute("ALTER TABLE channel_calls ADD COLUMN billing_json TEXT")
+            if 'error_json' not in columns:
+                db.execute("ALTER TABLE channel_calls ADD COLUMN error_json TEXT")
 
     @staticmethod
     def project(row):
@@ -61,14 +72,21 @@ class Calls:
         # finished_at is when we observed completion, not the supplier's finish
         # time. Delayed polling must never become a fabricated generation duration.
         elapsed = None
+        billing = json.loads(row['billing_json']) if row.get('billing_json') else None
         return {'schema_version': 1, 'call_id': row['id'], 'task_id': row['task_id'],
                 'account_id': row['account_id'], 'model_id': row['model_id'],
                 'account_name': row.get('account_name'), 'account_status': row.get('account_status'),
                 'media': 'video', 'operation': 'generate', 'duration_seconds': elapsed,
                 'duration_source': 'local_elapsed' if elapsed is not None else 'unknown',
                 'state': row['state'], 'accepted': None if row['accepted'] is None else bool(row['accepted']),
-                'revision': row['revision'], 'reason_code': None,
-                'budget': {'amount': row['budget_amount'], 'unit': 'USD', 'source': 'unknown'},
+                'revision': row['revision'],
+                'reason_code': json.loads(row['error_json'])['code'] if row.get('error_json') else None,
+                'error': json.loads(row['error_json']) if row.get('error_json') else None,
+                'budget': {'amount': row['budget_amount'], 'unit': 'USD',
+                           'source': billing['estimate']['source'] if billing else 'unknown'},
+                'reservation': {'amount': None if row.get('reservation_unknown') else row['reservation_amount'],
+                                'unit': 'USD', 'source': 'unknown' if row.get('reservation_unknown') else 'budget_limit'},
+                'pricing': billing,
                 'settlement': {'amount': row['settlement_amount'], 'unit': 'USD',
                                'source': row['settlement_source']},
                 'created_at': row['created_at'], 'updated_at': row['updated_at']}
@@ -169,6 +187,10 @@ class Calls:
             if db.execute('SELECT 1 FROM submissions WHERE organization_id=? AND operation_id=?',
                           (organization, operation)).fetchone():
                 raise Conflict('legacy_call_requires_recovery')
+            billing = estimate(model, payload)
+            estimated = billing['estimate']['amount']
+            if estimated is not None and Decimal(estimated) > Decimal(ceiling):
+                raise Conflict('budget_below_estimate')
             if account_id:
                 account = Accounts.row(db, organization, account_id)
             else:
@@ -206,10 +228,11 @@ class Calls:
             call_id, timestamp = str(uuid.uuid4()), now()
             db.execute('''INSERT INTO channel_calls
                 (id,organization_id,caller_id,operation_id,digest,task_id,account_id,credential_version,
-                 quota_subject_id,model_id,state,reservation_amount,created_at,updated_at,proxy_json)
-                VALUES (?,?,?,?,?,?,?,?,?,?,'acceptance_unknown',?,?,?,?)''',
+                 quota_subject_id,model_id,state,reservation_amount,created_at,updated_at,proxy_json,budget_amount,billing_json)
+                VALUES (?,?,?,?,?,?,?,?,?,?,'acceptance_unknown',?,?,?,?,?,?)''',
                 (call_id, organization, caller, operation, digest, task, account['id'],
-                 account['credential_version'], account['quota_subject_id'], model, ceiling, timestamp, timestamp, json.dumps(proxy)))
+                 account['credential_version'], account['quota_subject_id'], model, ceiling, timestamp, timestamp,
+                 json.dumps(proxy), estimated, json.dumps(billing)))
             return dict(db.execute('SELECT * FROM channel_calls WHERE id=?', (call_id,)).fetchone()), True
 
     def credential(self, row):
@@ -221,23 +244,50 @@ class Calls:
             raise Conflict('recovery_credentials_unavailable')
         return self.store.cipher.decrypt(key['ciphertext']).decode()
 
+    def settle_bill(self, original, actor, bill):
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            current = db.execute('SELECT * FROM channel_calls WHERE organization_id=? AND id=?',
+                                 (original['organization_id'], original['id'])).fetchone()
+            if current is None:
+                raise KeyError('call_not_found')
+            existing = db.execute('SELECT * FROM channel_call_settlements WHERE call_id=?', (original['id'],)).fetchone()
+            if existing:
+                if (existing['evidence_digest'] != bill['evidence_digest'] or existing['amount'] != bill['amount']
+                        or current['settlement_amount'] != existing['amount'] or current['settlement_source'] != existing['source']):
+                    raise Conflict('settlement_conflict')
+                return self.project(current)
+            if current['settlement_amount'] is not None:
+                raise Conflict('settlement_conflict')
+            if (current['revision'] != original['revision']
+                    or current['provider_request_id'] != original['provider_request_id']
+                    or current['model_id'] != original['model_id']):
+                raise Conflict('revision_conflict')
+            db.execute('INSERT INTO channel_call_settlements VALUES (?,?,?,?,?,?,?,?,?)',
+                       (original['id'], original['organization_id'], actor, bill['amount'], bill['source'],
+                        bill['evidence_digest'], bill['evidence_json'], bill['event_count'], bill['observed_at']))
+            db.execute('UPDATE channel_calls SET settlement_amount=?,settlement_source=?,revision=revision+1,updated_at=? WHERE id=?',
+                       (bill['amount'], bill['source'], now(), original['id']))
+            return self.project(db.execute('SELECT * FROM channel_calls WHERE id=?', (original['id'],)).fetchone())
+
     def accepted(self, call_id, remote):
         with self.store.connect() as db:
             db.execute("UPDATE channel_calls SET provider_request_id=?,state='queued',accepted=1,"
                        "revision=revision+1,updated_at=? WHERE id=? AND accepted IS NULL",
                        (remote, now(), call_id))
 
-    def rejected(self, call_id):
+    def rejected(self, call_id, error=None):
         with self.store.connect() as db:
             db.execute("UPDATE channel_calls SET state='rejected',accepted=0,reservation_amount='0',reservation_unknown=0,"
-                       "revision=revision+1,updated_at=?,finished_at=? WHERE id=? AND accepted IS NULL",
-                       (timestamp := now(), timestamp, call_id))
+                       "revision=revision+1,updated_at=?,finished_at=?,error_json=? WHERE id=? AND accepted IS NULL",
+                       (timestamp := now(), timestamp, json.dumps(error) if error else None, call_id))
 
-    def observed(self, call_id, state):
+    def observed(self, call_id, state, error=None):
         if state not in {'in_queue', 'in_progress', 'completed', 'failed'}:
             raise ValueError('invalid_call_state')
         with self.store.connect() as db:
             timestamp = now()
-            db.execute("UPDATE channel_calls SET state=?,updated_at=?,finished_at=?,revision=revision+1 "
+            db.execute("UPDATE channel_calls SET state=?,updated_at=?,finished_at=?,error_json=?,revision=revision+1 "
                        "WHERE id=? AND accepted=1 AND state NOT IN ('completed','failed') AND state!=?",
-                       (state, timestamp, timestamp if state in {'completed', 'failed'} else None, call_id, state))
+                       (state, timestamp, timestamp if state in {'completed', 'failed'} else None,
+                        json.dumps(error) if error else None, call_id, state))
