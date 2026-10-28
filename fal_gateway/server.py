@@ -35,8 +35,9 @@ from .errors import provider_failure, failure
 
 MODEL = "minimax/h3/reference-to-video"
 SD2_MODEL = "bytedance/seedance-2.0/reference-to-video"
-CALL_MODELS = {MODEL, SD2_MODEL}
-REQUEST_PATHS = {MODEL: "minimax/h3", SD2_MODEL: "bytedance/seedance-2.0"}
+LIP_MODEL = "minimax/h3-max/lip-sync/image-to-video"
+CALL_MODELS = {MODEL, SD2_MODEL, LIP_MODEL}
+REQUEST_PATHS = {MODEL: "minimax/h3", SD2_MODEL: "bytedance/seedance-2.0", LIP_MODEL: "minimax/h3-max"}
 QUEUE = "https://queue.fal.run"
 CHECK = "https://api.fal.ai/v1/models/requests/by-endpoint"
 IDENTITY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
@@ -191,6 +192,19 @@ class Gateway:
 
     @staticmethod
     def validate_payload(value, model=MODEL) -> dict:
+        if model == LIP_MODEL:
+            fields = {"image_url", "audio_url", "resolution", "enable_transcription", "enable_safety_checker"}
+            if not isinstance(value, dict) or set(value) != fields:
+                raise APIError("invalid_payload")
+            if (value.get("resolution") not in {"480P", "768P"}
+                    or value.get("enable_transcription") is not True
+                    or value.get("enable_safety_checker") is not True):
+                raise APIError("unsupported_profile")
+            for field, prefix in (("image_url", "data:image/"), ("audio_url", "data:audio/")):
+                ref = value.get(field)
+                if not isinstance(ref, str) or not ref.startswith(prefix) or ";base64," not in ref:
+                    raise APIError("invalid_payload")
+            return value
         if model == SD2_MODEL:
             fields = {"prompt", "duration", "resolution", "aspect_ratio", "generate_audio",
                       "image_urls", "video_urls", "audio_urls"}

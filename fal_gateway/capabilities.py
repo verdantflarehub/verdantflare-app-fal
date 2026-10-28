@@ -16,6 +16,7 @@ _RESOLUTION = re.compile(r"(?:[1-9][0-9]*[pP]|[24]K)\Z")
 _EXISTING_EXECUTION = {
     "minimax/h3/reference-to-video",
     "bytedance/seedance-2.0/reference-to-video",
+    "minimax/h3-max/lip-sync/image-to-video",
 }
 
 

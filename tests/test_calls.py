@@ -2,6 +2,9 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
 import unittest
+import base64
+import io
+import wave
 
 from cryptography.fernet import Fernet
 import httpx
@@ -9,9 +12,17 @@ from starlette.testclient import TestClient
 
 from fal_gateway.accounts import Accounts
 from fal_gateway.calls import Calls, amount
-from fal_gateway.server import Gateway, MODEL, SD2_MODEL, create_apps
+from fal_gateway.server import Gateway, MODEL, SD2_MODEL, LIP_MODEL, create_apps
 from fal_gateway.store import Conflict, Store
 from test_gateway import PAYLOAD, MANAGE, EXECUTE, KEY
+
+
+def lip_audio(seconds=5):
+    output = io.BytesIO()
+    with wave.open(output, 'wb') as audio:
+        audio.setparams((1, 2, 16000, 0, 'NONE', 'not compressed'))
+        audio.writeframes(b'\0\0' * int(seconds * 16000))
+    return 'data:audio/wav;base64,' + base64.b64encode(output.getvalue()).decode()
 
 
 class CallsTest(unittest.TestCase):
@@ -76,6 +87,53 @@ class CallsTest(unittest.TestCase):
         self.assertEqual(observed.status_code, 200)
         self.assertEqual(observed.json()['state'], 'completed')
         self.assertEqual(len([x for x in self.sent if x[0] == 'POST']), 1)
+
+    def test_lip_sync_exact_endpoint_idempotency_and_recovery(self):
+        payload = {'image_url': 'data:image/png;base64,AAAA', 'audio_url': lip_audio(),
+                   'resolution': '768P', 'enable_transcription': True, 'enable_safety_checker': True}
+        first = self.submit(model_id=LIP_MODEL, payload=payload)
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()['budget']['amount'], '0.40')
+        self.assertIn('https://queue.fal.run/' + LIP_MODEL, self.urls)
+        again = self.submit(model_id=LIP_MODEL, payload=payload)
+        self.assertEqual(again.json()['call_id'], first.json()['call_id'])
+        path = '/v1/calls/' + first.json()['call_id']
+        self.assertEqual(self.client.get(path, headers=self.headers).json()['state'], 'completed')
+        result = self.client.get(path + '/result', headers=self.headers)
+        self.assertEqual(result.status_code, 200)
+        self.assertIn('https://queue.fal.run/minimax/h3-max/requests/original-request', self.urls)
+        self.assertIn('https://queue.fal.run/minimax/h3-max/requests/original-request/status', self.urls)
+        self.assertEqual(sum(m == 'POST' for m, _ in self.sent), 1)
+        self.assertEqual(self.client.get(path, headers={**self.headers, 'X-Organization-Id': 'other'}).status_code, 404)
+
+    def test_lip_sync_rejects_generic_fields_or_remote_urls_before_reservation(self):
+        payload = {'image_url': 'data:image/png;base64,AAAA', 'audio_url': 'data:audio/wav;base64,AAAA',
+                   'resolution': '480P', 'enable_transcription': True, 'enable_safety_checker': True}
+        invalid = [dict(payload, prompt='ignored text'), dict(payload, duration=5),
+                   dict(payload, aspect_ratio='9:16'), dict(payload, enable_safety_checker=False),
+                   dict(payload, audio_url='https://example.com/audio.wav'), dict(payload, resolution='2K')]
+        for i, value in enumerate(invalid):
+            with self.subTest(index=i):
+                self.assertEqual(self.submit('invalid-' + str(i), model_id=LIP_MODEL, payload=value).status_code, 400)
+                with self.assertRaises(KeyError):
+                    self.gateway.calls.by_operation('org', 'video-mcp', 'invalid-' + str(i))
+        self.assertEqual(self.sent, [])
+
+    def test_lip_sync_measured_price_and_insufficient_budget(self):
+        payload = {'image_url': 'data:image/png;base64,AAAA', 'audio_url': lip_audio(),
+                   'resolution': '768P', 'enable_transcription': True, 'enable_safety_checker': True}
+        quote = self.client.post('/v1/cost', headers=self.headers,
+            json={'model_id': LIP_MODEL, 'payload': payload})
+        self.assertEqual(quote.status_code, 200)
+        self.assertEqual(quote.json()['estimate']['amount'], '0.40')
+        rejected = self.submit(model_id=LIP_MODEL, payload=payload, budget_limit='0.39')
+        self.assertEqual(rejected.status_code, 409)
+        self.assertEqual(rejected.json()['error'], 'budget_below_estimate')
+        self.assertEqual(self.sent, [])
+        for invalid in ('data:audio/wav;base64,AAAA', lip_audio(4.9), lip_audio(15.1)):
+            rejected = self.submit(model_id=LIP_MODEL, payload=dict(payload, audio_url=invalid))
+            self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(self.sent, [])
 
     def test_seedance_uses_fixed_endpoint_and_recovers_by_original_model(self):
         payload = {'prompt': '@Image1: one ice cube falls into a glass', 'duration': 5,

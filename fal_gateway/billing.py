@@ -4,13 +4,18 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 import hashlib
+import base64
+import binascii
+import io
 import json
+import wave
 
 import httpx
 
 
 H3 = 'minimax/h3/reference-to-video'
 SD2 = 'bytedance/seedance-2.0/reference-to-video'
+LIP = 'minimax/h3-max/lip-sync/image-to-video'
 BILLING_URL = 'https://api.fal.ai/v1/models/billing-events'
 REVIEWED_AT = datetime(2026, 10, 27, tzinfo=UTC)
 VALID_UNTIL = REVIEWED_AT + timedelta(days=30)
@@ -46,6 +51,29 @@ def estimate(model, payload, *, at=None):
         value.update(estimate={'amount': format(total, 'f'), 'unit': 'USD', 'source': 'official_price_table'},
                      rates={'output_second': '0.05', 'extra_image': '0.08', 'free_images': 5},
                      reason_code=None)
+    elif model == LIP and payload.get('resolution') in {'480P', '768P'}:
+        # The first VF adapter accepts PCM WAV, so its quantity is measured from
+        # the submitted bytes rather than an unrelated caller duration field.
+        try:
+            uri = payload['audio_url']
+            if not uri.startswith('data:audio/wav;base64,'):
+                raise ValueError()
+            blob = base64.b64decode(uri.split(',', 1)[1], validate=True)
+            with wave.open(io.BytesIO(blob), 'rb') as audio:
+                frames, rate = audio.getnframes(), audio.getframerate()
+                if audio.getcomptype() != 'NONE' or not 5 * rate <= frames <= 15 * rate:
+                    raise ValueError()
+                if len(audio.readframes(frames)) != frames * audio.getnchannels() * audio.getsampwidth():
+                    raise ValueError()
+            seconds = Decimal(frames) / Decimal(rate)
+        except (KeyError, TypeError, AttributeError, ValueError, EOFError, wave.Error, binascii.Error):
+            raise BillingError('lip_sync_pcm_wav_required', 400) from None
+        unit_price = Decimal('0.05' if payload['resolution'] == '480P' else '0.08')
+        value.update(price_version='fal-lip-sync-20261028',
+                     reviewed_at=datetime(2026, 10, 28, tzinfo=UTC).isoformat(),
+                     estimate={'amount': format(seconds * unit_price, 'f'), 'unit': 'USD',
+                               'source': 'official_price_table'},
+                     rates={'output_second': str(unit_price), 'audio_seconds': str(seconds)}, reason_code=None)
     elif model == SD2 and payload.get('resolution') in {'480p', '720p'}:
         video_reference = bool(payload.get('video_urls'))
         value.update(rates={'video_tokens_1000': '0.0086016' if video_reference else '0.014',
