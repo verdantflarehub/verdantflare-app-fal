@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_CEILING
 import hashlib
 import base64
 import binascii
@@ -94,6 +94,25 @@ def _decimal(value):
     if not result.is_finite() or result < 0 or result > Decimal('1e24'):
         raise BillingError('billing_response_invalid', 502)
     return result
+
+
+def business_estimate(model, payload):
+    """Conservative local occupancy, explicitly not a supplier settlement."""
+    if model != H3 or payload.get('resolution') != '480P':
+        raise BillingError('business_estimate_not_supported')
+    quote = estimate(model, payload)
+    value = Decimal(quote['estimate']['amount']).quantize(Decimal('0.01'), rounding=ROUND_CEILING)
+    evidence = {'schema_version': 1, 'model_id': model, 'input_digest': quote['input_digest'],
+                'duration_seconds': payload['duration'], 'resolution': payload['resolution'],
+                'reference_image_count': len(payload.get('reference_image_urls', [])),
+                'rates': quote['rates'], 'source_url': quote['source_url'],
+                'price_version': quote['price_version'], 'price_reviewed_at': quote['reviewed_at'],
+                'rounding': 'ceil_usd_cent', 'discount_applied': False, 'amount': format(value, 'f'),
+                'source': 'official_price_table_estimate', 'unit': 'USD'}
+    encoded = json.dumps(evidence, sort_keys=True, separators=(',', ':'))
+    return {'amount': evidence['amount'], 'source': evidence['source'], 'evidence_json': encoded,
+            'evidence_digest': hashlib.sha256(encoded.encode()).hexdigest(),
+            'observed_at': quote['quoted_at']}
 
 
 def fetch_bill(client, key, call, *, at=None):

@@ -24,3 +24,18 @@ test('logs distinguish unfinished fees, unknown final fees and confirmed zero', 
   assert.match(html, /<td class="num">5 USD<\/td>/);
   assert.match(html, /<td class="num">6 USD<\/td>/);
 });
+
+test('business estimate remains visibly separate from actual settlement', () => {
+  const context=vm.createContext({window:{},document:{querySelector:()=>({})},AbortController});
+  vm.runInContext(readFileSync(new URL('../dashboard/dashboard.mjs',import.meta.url),'utf8'),context);
+  const run=code=>vm.runInContext(code,context);
+  run(`logs={accounts:[],summary:{task_count:1,budget:{amount:null,unknown_count:1},settlement:{amount:null,unknown_count:1},budget_occupancy:{amount:'0.25',unknown_count:0,estimated_count:1}},items:[{created_at:'2026-10-16T00:00:00Z',task_id:'task',model_id:'H3',state:'completed',budget:{amount:null},settlement:{amount:null},business_estimate:{amount:'0.25'},budget_occupancy:{amount:'0.25',source:'business_estimate'}}]}`);
+  const html=run('logView()');
+  assert.match(html, /估算占用，非实际扣费/);
+  assert.match(html, /估算费用 0.25 USD（非实扣）/);
+  assert.match(html, /<td class="num">未知<\/td>/);
+  assert.doesNotMatch(html, /已对账|已扣费/);
+  run(`logs.items[0].settlement.amount='0.20';logs.items[0].budget_occupancy={amount:'0.20',source:'fal_billing_events'}`);
+  assert.match(run('logView()'), /按实际结算/);
+  assert.match(run('logView()'), /估算费用 0.25 USD（非实扣）/);
+});

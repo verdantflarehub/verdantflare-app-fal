@@ -349,6 +349,13 @@ class Gateway:
             raise APIError('proxy_unavailable', 503) from None
         return self.calls.settle_bill(item, actor, bill)
 
+    def estimate_call(self, org, actor, call_id, revision, payload):
+        item = self.calls.get(org, call_id)
+        if item['revision'] != revision:
+            raise Conflict('revision_conflict')
+        self.validate_payload(payload, item['model_id'])
+        return self.calls.estimate_business(item, actor, payload)
+
     def _remote(self, item, key, result, *, timeout=30, legacy=False):
         model = item.get("model_id", MODEL)
         if model not in REQUEST_PATHS:
@@ -478,6 +485,13 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
                 return Response(data, headers={"Content-Type": mime, "Cache-Control": "no-store",
                                                "X-Content-Type-Options": "nosniff"})
             org = authenticate(request, management_token, manage=True)
+            if path.endswith('/estimate') and 'call_id' in request.path_params:
+                data = await body(request, 1024 * 1024)
+                if set(data) != {'expected_revision', 'payload'}:
+                    raise APIError('invalid_business_estimate_request')
+                revision = number(data['expected_revision'], 1, 2**31 - 1)
+                return respond(await run_in_threadpool(gateway.estimate_call, org,
+                    request.headers['x-user-id'], str(request.path_params['call_id']), revision, data['payload']))
             if path.endswith('/settlement/refresh') and 'call_id' in request.path_params:
                 data = await body(request)
                 if set(data) != {'expected_revision'}:
@@ -718,6 +732,7 @@ def create_apps(gateway: Gateway | None = None, management_token: str | None = N
         Route('/v1/calls/search', manage, methods=['POST']),
         Route('/v1/calls/refresh', manage, methods=['POST']),
         Route('/v1/calls/{call_id:uuid}/settlement/refresh', manage, methods=['POST']),
+        Route('/v1/calls/{call_id:uuid}/estimate', manage, methods=['POST']),
         Route('/v1/accounts/search', manage, methods=['POST']),
         Route("/v1/accounts", manage, methods=["GET", "POST"]),
         Route("/v1/accounts/{account_id:uuid}", manage, methods=["GET", "PATCH", "DELETE"]),

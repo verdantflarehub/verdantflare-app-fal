@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import uuid
 from decimal import Decimal, InvalidOperation
@@ -10,7 +11,26 @@ from datetime import datetime, UTC
 from .accounts import Accounts
 from .store import Conflict, now
 from .proxy import proxy_reference
-from .billing import estimate
+from .billing import business_estimate, estimate, input_digest
+
+
+ESTIMATE_FIELDS = ('e.amount AS business_estimate_amount,e.source AS business_estimate_source,'
+                   'e.evidence_json AS business_estimate_evidence,e.observed_at AS business_estimate_observed_at')
+ESTIMATE_JOIN = (' LEFT JOIN channel_call_estimates e ON e.call_id=c.id '
+                'AND e.organization_id=c.organization_id ')
+
+
+def occupancy(row):
+    row = dict(row)
+    if row['settlement_amount'] is not None:
+        return {'amount': row['settlement_amount'], 'unit': 'USD', 'source': row['settlement_source']}
+    estimated = row.get('business_estimate_amount')
+    if row.get('accepted') != 1 or row.get('state') != 'completed':
+        estimated = None
+    reserved = None if row.get('reservation_unknown') else row['reservation_amount']
+    if estimated is not None and (reserved is None or Decimal(estimated) > Decimal(reserved)):
+        return {'amount': estimated, 'unit': 'USD', 'source': 'business_estimate'}
+    return {'amount': reserved, 'unit': 'USD', 'source': 'budget_limit' if reserved is not None else 'unknown'}
 
 
 def amount(value):
@@ -51,6 +71,12 @@ class Calls:
                   evidence_digest TEXT NOT NULL, evidence_json TEXT NOT NULL,
                   event_count INTEGER NOT NULL, observed_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS channel_call_estimates (
+                  call_id TEXT PRIMARY KEY, organization_id TEXT NOT NULL,
+                  actor TEXT NOT NULL, amount TEXT NOT NULL, source TEXT NOT NULL,
+                  original_digest TEXT NOT NULL, evidence_digest TEXT NOT NULL,
+                  evidence_json TEXT NOT NULL, observed_at TEXT NOT NULL
+                );
             ''')
             columns = {row['name'] for row in db.execute('PRAGMA table_info(channel_calls)')}
             if 'finished_at' not in columns:
@@ -89,11 +115,17 @@ class Calls:
                 'pricing': billing,
                 'settlement': {'amount': row['settlement_amount'], 'unit': 'USD',
                                'source': row['settlement_source']},
+                'business_estimate': {'amount': row.get('business_estimate_amount'), 'unit': 'USD',
+                    'source': row.get('business_estimate_source') or 'unknown',
+                    'observed_at': row.get('business_estimate_observed_at'),
+                    'basis': json.loads(row['business_estimate_evidence']) if row.get('business_estimate_evidence') else None},
+                'budget_occupancy': occupancy(row),
                 'created_at': row['created_at'], 'updated_at': row['updated_at']}
 
     def get(self, organization, call_id, caller=None):
         with self.store.connect() as db:
-            row = db.execute('SELECT * FROM channel_calls WHERE organization_id=? AND id=?',
+            row = db.execute('SELECT c.*,' + ESTIMATE_FIELDS + ' FROM channel_calls c' + ESTIMATE_JOIN +
+                             'WHERE c.organization_id=? AND c.id=?',
                              (organization, call_id)).fetchone()
         if row is None or (caller is not None and row['caller_id'] != caller):
             raise KeyError('call_not_found')
@@ -101,7 +133,8 @@ class Calls:
 
     def by_operation(self, organization, caller, operation):
         with self.store.connect() as db:
-            row = db.execute('SELECT * FROM channel_calls WHERE organization_id=? AND caller_id=? AND operation_id=?',
+            row = db.execute('SELECT c.*,' + ESTIMATE_FIELDS + ' FROM channel_calls c' + ESTIMATE_JOIN +
+                             'WHERE c.organization_id=? AND c.caller_id=? AND c.operation_id=?',
                              (organization, caller, operation)).fetchone()
         if row is None:
             raise KeyError('call_not_found')
@@ -147,12 +180,12 @@ class Calls:
                 where.append('c.created_at' + comparison + '?')
                 values.append(bound)
         query = (' FROM channel_calls c LEFT JOIN channel_accounts a ON '
-                 'a.id=c.account_id AND a.organization_id=c.organization_id WHERE ' + ' AND '.join(where))
+                 'a.id=c.account_id AND a.organization_id=c.organization_id' + ESTIMATE_JOIN + 'WHERE ' + ' AND '.join(where))
         with self.store.connect() as db:
             # Both the page and full-filter summary come from the same read snapshot.
             db.execute('BEGIN')
-            amounts = db.execute('SELECT budget_amount,settlement_amount' + query, values).fetchall()
-            rows = db.execute('SELECT c.*,a.name AS account_name,a.status AS account_status' + query +
+            amounts = db.execute('SELECT c.*,' + ESTIMATE_FIELDS + query, values).fetchall()
+            rows = db.execute('SELECT c.*,' + ESTIMATE_FIELDS + ',a.name AS account_name,a.status AS account_status' + query +
                               ' ORDER BY c.created_at DESC,c.id LIMIT ? OFFSET ?',
                               [*values, limit, offset]).fetchall()
             account_options = db.execute('SELECT id AS account_id,name,status FROM channel_accounts '
@@ -161,10 +194,15 @@ class Calls:
             known = [Decimal(row[field]) for row in amounts if row[field] is not None]
             return {'amount': format(sum(known, Decimal(0)), 'f') if known or not amounts else None,
                     'unit': 'USD', 'unknown_count': len(amounts) - len(known)}
+        effective = [occupancy(row) for row in amounts]
+        known_occupancy = [Decimal(value['amount']) for value in effective if value['amount'] is not None]
+        occupancy_total = {'amount': format(sum(known_occupancy, Decimal(0)), 'f') if known_occupancy or not amounts else None,
+                           'unit': 'USD', 'unknown_count': len(amounts) - len(known_occupancy),
+                           'estimated_count': sum(value['source'] == 'business_estimate' for value in effective)}
         return {'schema_version': 1, 'items': [self.project(row) for row in rows], 'total': len(amounts),
                 'accounts': [dict(row) for row in account_options],
                 'summary': {'task_count': len(amounts), 'budget': total('budget_amount'),
-                            'settlement': total('settlement_amount')}}
+                            'settlement': total('settlement_amount'), 'budget_occupancy': occupancy_total}}
 
     @staticmethod
     def _admit(db, organization, account_id, ceiling):
@@ -193,13 +231,13 @@ class Calls:
                                (organization, account['quota_subject_id'], datetime.now(UTC).date().isoformat())).fetchone()[0]
             if count >= min(daily_limits):
                 raise Conflict('daily_limit_reached')
-        charges = db.execute('SELECT reservation_amount,settlement_amount,reservation_unknown FROM channel_calls '
-                             'WHERE organization_id=? AND quota_subject_id=?',
+        charges = db.execute('SELECT c.*,' + ESTIMATE_FIELDS + ' FROM channel_calls c' + ESTIMATE_JOIN +
+                             'WHERE c.organization_id=? AND c.quota_subject_id=?',
                              (organization, account['quota_subject_id'])).fetchall()
-        if limits and any(row['reservation_unknown'] and row['settlement_amount'] is None for row in charges):
+        effective = [occupancy(row) for row in charges]
+        if limits and any(value['amount'] is None for value in effective):
             raise Conflict('historical_cost_unknown')
-        committed = sum((Decimal(row['settlement_amount']) if row['settlement_amount'] is not None
-                         else Decimal(row['reservation_amount']) for row in charges), Decimal(0))
+        committed = sum((Decimal(value['amount']) for value in effective if value['amount'] is not None), Decimal(0))
         if limits and committed + Decimal(ceiling) > min(limits):
             raise Conflict('budget_exceeded')
         return account, proxy
@@ -216,7 +254,8 @@ class Calls:
         digest = hashlib.sha256(canonical.encode()).hexdigest()
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            previous = db.execute('SELECT * FROM channel_calls WHERE organization_id=? AND caller_id=? AND operation_id=?',
+            previous = db.execute('SELECT c.*,' + ESTIMATE_FIELDS + ' FROM channel_calls c' + ESTIMATE_JOIN +
+                                  'WHERE c.organization_id=? AND c.caller_id=? AND c.operation_id=?',
                                   (organization, caller, operation)).fetchone()
             if previous:
                 if previous['digest'] != digest:
@@ -273,10 +312,53 @@ class Calls:
             raise Conflict('recovery_credentials_unavailable')
         return self.store.cipher.decrypt(key['ciphertext']).decode()
 
+    def estimate_business(self, original, actor, payload):
+        if original['accepted'] != 1 or original['state'] != 'completed' or not original['provider_request_id']:
+            raise Conflict('business_estimate_requires_completed_call')
+        if original['settlement_amount'] is not None:
+            raise Conflict('business_estimate_not_required')
+        if original['caller_id'] == 'legacy-video-mcp':
+            canonical = json.dumps(payload, sort_keys=True, separators=(',', ':'), ensure_ascii=False)
+            expected = hashlib.sha256((original['model_id'] + '\n' + canonical).encode()).hexdigest()
+            verified = hmac.compare_digest(expected, original['digest'])
+        else:
+            billing = json.loads(original['billing_json']) if original.get('billing_json') else {}
+            verified = hmac.compare_digest(input_digest(original['model_id'], payload), billing.get('input_digest', ''))
+        if not verified:
+            raise Conflict('business_estimate_input_mismatch')
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            current = db.execute('SELECT c.*,' + ESTIMATE_FIELDS + ' FROM channel_calls c' + ESTIMATE_JOIN +
+                                 'WHERE c.organization_id=? AND c.id=?',
+                                 (original['organization_id'], original['id'])).fetchone()
+            if current is None:
+                raise KeyError('call_not_found')
+            if any(current[field] != original[field] for field in ('revision', 'digest', 'provider_request_id',
+                    'model_id', 'accepted', 'state', 'settlement_amount')):
+                raise Conflict('revision_conflict')
+            existing = db.execute('SELECT * FROM channel_call_estimates WHERE call_id=?', (original['id'],)).fetchone()
+            if existing:
+                saved = json.loads(existing['evidence_json'])
+                if (existing['original_digest'] != original['digest']
+                        or saved.get('input_digest') != input_digest(original['model_id'], payload)
+                        or saved.get('amount') != existing['amount'] or saved.get('source') != existing['source']
+                        or hashlib.sha256(existing['evidence_json'].encode()).hexdigest() != existing['evidence_digest']):
+                    raise Conflict('business_estimate_conflict')
+            else:
+                evidence = business_estimate(original['model_id'], payload)
+                db.execute('INSERT INTO channel_call_estimates VALUES (?,?,?,?,?,?,?,?,?)',
+                           (original['id'], original['organization_id'], actor, evidence['amount'], evidence['source'],
+                            original['digest'], evidence['evidence_digest'], evidence['evidence_json'], evidence['observed_at']))
+                db.execute('UPDATE channel_calls SET revision=revision+1,updated_at=? WHERE id=?', (now(), original['id']))
+            row = db.execute('SELECT c.*,' + ESTIMATE_FIELDS + ' FROM channel_calls c' + ESTIMATE_JOIN +
+                             'WHERE c.id=?', (original['id'],)).fetchone()
+            return self.project(row)
+
     def settle_bill(self, original, actor, bill):
         with self.store.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            current = db.execute('SELECT * FROM channel_calls WHERE organization_id=? AND id=?',
+            current = db.execute('SELECT c.*,' + ESTIMATE_FIELDS + ' FROM channel_calls c' + ESTIMATE_JOIN +
+                                 'WHERE c.organization_id=? AND c.id=?',
                                  (original['organization_id'], original['id'])).fetchone()
             if current is None:
                 raise KeyError('call_not_found')
@@ -297,7 +379,8 @@ class Calls:
                         bill['evidence_digest'], bill['evidence_json'], bill['event_count'], bill['observed_at']))
             db.execute('UPDATE channel_calls SET settlement_amount=?,settlement_source=?,revision=revision+1,updated_at=? WHERE id=?',
                        (bill['amount'], bill['source'], now(), original['id']))
-            return self.project(db.execute('SELECT * FROM channel_calls WHERE id=?', (original['id'],)).fetchone())
+            return self.project(db.execute('SELECT c.*,' + ESTIMATE_FIELDS + ' FROM channel_calls c' + ESTIMATE_JOIN +
+                                           'WHERE c.id=?', (original['id'],)).fetchone())
 
     def accepted(self, call_id, remote):
         with self.store.connect() as db:

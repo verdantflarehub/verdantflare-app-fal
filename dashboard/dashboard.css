@@ -1302,14 +1302,15 @@ html {
   color: var(--muted);
   font-size: 12px;
 }
-.log-table { table-layout: fixed; min-width: 1080px; }
-.log-table .log-task { width: 20%; }
-.log-table .log-account { width: 13%; }
-.log-table .log-media { width: 9%; }
-.log-table .log-model { width: 19%; }
-.log-table .log-state { width: 11%; }
-.log-table .log-duration { width: 7%; }
-.log-table .log-money { width: 10.5%; }
+.log-table { table-layout: fixed; min-width: 1280px; }
+.log-table .log-task { width: 18%; }
+.log-table .log-account { width: 10%; }
+.log-table .log-media { width: 7%; }
+.log-table .log-model { width: 16%; }
+.log-table .log-state { width: 9%; }
+.log-table .log-duration { width: 6%; }
+.log-table .log-money { width: 9%; }
+.log-table .log-occupancy { width: 16%; }
 .log-table td { overflow-wrap: anywhere; }
 .log-table td:nth-child(3), .log-table td:nth-child(5), .log-table td.num {
   white-space: nowrap;
