@@ -116,6 +116,20 @@ class Accounts:
                 'WHERE account_id=? AND version=?', (account, row['credential_version'])).fetchone()
             return row['revision'], self.store.cipher.decrypt(credential['ciphertext']).decode(), json.loads(row['proxy_json'])
 
+    def billing_credential(self, organization, account):
+        """Current read authorization for this exact local account, never a fallback account."""
+        with self.store.connect() as db:
+            row = self.row(db, organization, account)
+            if row['status'] != 'active' or row['authorization_state'] != 'active':
+                raise Conflict('billing_credentials_unavailable')
+            credential = db.execute('SELECT ciphertext FROM channel_account_credentials '
+                'WHERE account_id=? AND version=?', (account, row['credential_version'])).fetchone()
+            if credential is None:
+                raise Conflict('billing_credentials_unavailable')
+            access = {'organization_id': organization, 'account_id': account,
+                      'credential_version': row['credential_version'], 'account_revision': row['revision']}
+            return access, self.store.cipher.decrypt(credential['ciphertext']).decode()
+
     def checked(self, organization, actor, account, revision, state, new_key=None):
         if state not in {'active', 'invalid', 'unavailable'}:
             raise ValueError('invalid_authorization_state')

@@ -362,6 +362,16 @@ class Calls:
                                  (original['organization_id'], original['id'])).fetchone()
             if current is None:
                 raise KeyError('call_not_found')
+            access = bill.get('billing_access')
+            if access is not None:
+                if (access['organization_id'] != original['organization_id']
+                        or access['account_id'] != original['account_id']):
+                    raise Conflict('billing_account_mismatch')
+                account = Accounts.row(db, original['organization_id'], original['account_id'])
+                if (account['revision'] != access['account_revision']
+                        or account['credential_version'] != access['credential_version']
+                        or account['status'] != 'active' or account['authorization_state'] != 'active'):
+                    raise Conflict('billing_credentials_changed')
             existing = db.execute('SELECT * FROM channel_call_settlements WHERE call_id=?', (original['id'],)).fetchone()
             if existing:
                 if (existing['evidence_digest'] != bill['evidence_digest'] or existing['amount'] != bill['amount']

@@ -150,6 +150,95 @@ class SettlementTest(unittest.TestCase):
             self.f.gateway.calls.settle_bill(self.original, 'admin', self.bill)
         self.assertIsNone(self.f.gateway.calls.get('org', self.original_id)['settlement_amount'])
 
+    def rotate(self, key):
+        account = self.f.accounts.get('org', self.original['account_id'])
+        return self.f.accounts.checked('org', 'admin', account['account_id'], account['revision'], 'active', key)
+
+    def test_rotated_billing_key_settles_original_call_and_keeps_first_audit(self):
+        self.f.gateway.calls.estimate_business(self.original, 'admin', PAYLOAD)
+        self.original = self.f.gateway.calls.get('org', self.original_id)
+        new_key = 'rotated-billing-key-for-test'
+        self.rotate(new_key)
+        self.f.create_account('unrelated-default', default=True)
+        requests = []
+
+        def upstream(request):
+            requests.append(request)
+            if request.headers['Authorization'] == 'Key ' + KEY:
+                return httpx.Response(403)
+            return httpx.Response(200, json=page([bill_event(cost_total='0.30', cost_estimate_nano_usd=300000000)]))
+
+        with httpx.Client(transport=httpx.MockTransport(upstream)) as client, patch.object(self.f.gateway, 'client', client):
+            first = self.refresh()
+            self.assertEqual(first.status_code, 200, first.text)
+            value = first.json()
+            self.assertEqual(value['settlement']['amount'], '0.3')
+            self.assertEqual(value['business_estimate']['amount'], '0.25')
+            self.assertEqual(value['budget_occupancy']['amount'], '0.3')
+            self.assertEqual(requests[0].headers['Authorization'], 'Key ' + new_key)
+            after = self.f.gateway.calls.get('org', self.original_id)
+            for field in ('credential_version', 'account_id', 'quota_subject_id', 'provider_request_id', 'model_id',
+                          'accepted', 'state', 'digest', 'proxy_json', 'reservation_unknown', 'reservation_amount',
+                          'business_estimate_amount', 'business_estimate_evidence'):
+                self.assertEqual(after[field], self.original[field], field)
+            self.assertEqual(self.f.gateway.calls.credential(after), KEY)
+            self.rotate('another-billing-key-for-test')
+            again = self.refresh(revision=value['revision'])
+            self.assertEqual(again.json(), value)
+        self.assertTrue(all(request.method == 'GET' for request in requests))
+        self.assertTrue(all(request.url.params['request_id'] == 'original-request' for request in requests))
+        self.assertTrue(all(request.url.params['endpoint_id'] == H3 for request in requests))
+        with self.f.store.connect() as db:
+            evidence = list(db.execute('SELECT * FROM channel_call_settlements'))
+            self.assertEqual(len(evidence), 1)
+            access = json.loads(evidence[0]['evidence_json'])['billing_access']
+            self.assertEqual(access['credential_version'], 2)
+            self.assertEqual(access['account_id'], self.original['account_id'])
+            self.assertEqual(access['organization_id'], 'org')
+            self.assertNotIn(new_key, evidence[0]['evidence_json'])
+        summary = self.f.gateway.calls.list('org')['summary']['budget_occupancy']
+        self.assertEqual(summary['amount'], '0.3')
+        self.assertEqual(summary['estimated_count'], 0)
+
+    def test_current_key_denied_missing_or_foreign_bill_preserves_unknown(self):
+        self.rotate('rotated-billing-key-for-test')
+        cases = [(httpx.Response(403), 'billing_access_denied'),
+                 (httpx.Response(200, json=page([])), 'billing_record_not_found'),
+                 (httpx.Response(200, json=page([bill_event(endpoint_id=SD2)])), 'billing_identity_mismatch'),
+                 (httpx.Response(200, json=page([bill_event(request_id='other')])), 'billing_identity_mismatch')]
+        for response, code in cases:
+            with self.subTest(code=code), httpx.Client(transport=httpx.MockTransport(lambda request: response)) as client:
+                with patch.object(self.f.gateway, 'client', client):
+                    result = self.refresh()
+                self.assertEqual(result.json()['error'], code)
+                self.assertEqual(self.f.gateway.calls.get('org', self.original_id), self.original)
+
+    def test_account_scope_and_inactive_authorization_cannot_read_billing(self):
+        with self.assertRaises(KeyError):
+            self.f.accounts.billing_credential('other', self.original['account_id'])
+        for status, authorization in [('disabled', 'active'), ('archived', 'active'),
+                                      ('active', 'invalid'), ('active', 'pending_verification')]:
+            with self.subTest(status=status, authorization=authorization):
+                with self.f.store.connect() as db:
+                    db.execute('UPDATE channel_accounts SET status=?,authorization_state=? WHERE id=?',
+                               (status, authorization, self.original['account_id']))
+                with patch('fal_gateway.server.fetch_bill') as fetch:
+                    self.assertEqual(self.refresh().json()['error'], 'billing_credentials_unavailable')
+                    fetch.assert_not_called()
+                self.assertEqual(self.f.gateway.calls.get('org', self.original_id), self.original)
+
+    def test_rotation_during_read_rejects_settlement_commit(self):
+        def rotate_during_fetch(*args):
+            self.rotate('rotated-during-billing-read')
+            return self.bill
+        with patch('fal_gateway.server.fetch_bill', side_effect=rotate_during_fetch):
+            result = self.refresh()
+        self.assertEqual(result.status_code, 409)
+        self.assertEqual(result.json()['error'], 'billing_credentials_changed')
+        self.assertEqual(self.f.gateway.calls.get('org', self.original_id), self.original)
+        with self.f.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM channel_call_settlements').fetchone()[0], 0)
+
 
 class EstimateTest(unittest.TestCase):
     def test_h3_duration_and_extra_images_are_estimates_not_reservations(self):

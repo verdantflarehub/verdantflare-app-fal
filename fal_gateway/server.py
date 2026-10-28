@@ -342,11 +342,17 @@ class Gateway:
         item = self.calls.get(org, call_id)
         if item['revision'] != revision:
             raise Conflict('revision_conflict')
+        access, key = Accounts(self.store).billing_credential(org, item['account_id'])
         try:
             with self.transport(org, json.loads(item['proxy_json'])) as client:
-                bill = fetch_bill(client, self.calls.credential(item), item)
+                bill = fetch_bill(client, key, item)
         except ProxyUnavailable:
             raise APIError('proxy_unavailable', 503) from None
+        # The supplier event digest remains stable across credential rotation;
+        # retain the actual read authorization separately in immutable evidence.
+        evidence = {**json.loads(bill['evidence_json']), 'billing_access': access}
+        bill = {**bill, 'billing_access': access,
+                'evidence_json': json.dumps(evidence, sort_keys=True, separators=(',', ':'))}
         return self.calls.settle_bill(item, actor, bill)
 
     def estimate_call(self, org, actor, call_id, revision, payload):
